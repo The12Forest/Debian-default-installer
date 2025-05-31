@@ -1,7 +1,8 @@
-su-
-apt install sudo curl -y
-usermod -aG sudo $USER
-newgrp sudo
+# su-
+# apt install sudo curl -y
+# usermod -aG sudo $USER
+# exit
+# newgrp sudo
 
 
 sudo apt-get update
@@ -27,16 +28,18 @@ docker run -d -p 9001:9001 --name portainer_agent --restart=always -v /var/run/d
 
 # Cockpit
 
-su -
+# su -
 
-curl -sSL https://repo.45drives.com/setup | sudo bash
+sudo curl -sSL https://repo.45drives.com/setup | sudo bash
 . /etc/os-release
-echo "deb http://deb.debian.org/debian ${VERSION_CODENAME}-backports main" > \
+sudo echo "deb http://deb.debian.org/debian ${VERSION_CODENAME}-backports main" > \
     /etc/apt/sources.list.d/backports.list
-apt update
-apt install -t ${VERSION_CODENAME}-backports cockpit -y
+sudo apt update
+sudo apt install -t ${VERSION_CODENAME}-backports cockpit -y
 
-exit
+# exit
+# Install cockpit
+
 
 sudo apt install samba cockpit-storaged cockpit-networkmanager cockpit-file-sharing cockpit-identities  cockpit-benchmark -y
 
