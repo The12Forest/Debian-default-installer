@@ -19,7 +19,7 @@ sudo apt-get update
 
 sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
 
-sudo docker network create -d macvlan --subnet 192.168.188.0/23 --gateway 192.168.188.1 -o parrent=enp1s0 VIP
+sudo docker network create -d macvlan --subnet 192.168.188.0/23 --gateway 192.168.188.1 -o parent=enp1s0 VIP
 
 sudo usermod -aG docker $USER
 
