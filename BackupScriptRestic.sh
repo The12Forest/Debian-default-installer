@@ -1799,6 +1799,31 @@ menu_settings() {
 }
 
 # ==========================================
+# Skript systemweit installieren (-i)
+# ==========================================
+install_script() {
+    if [ "$EUID" -ne 0 ]; then
+        echo ">> FEHLER: Bitte mit 'sudo $0 -i' ausführen, um das Skript zu installieren."
+        exit 1
+    fi
+
+    local target="/usr/local/bin/restic-backup"
+
+    echo ">> Installiere Skript nach $target ..."
+    cp "$SCRIPT_PATH" "$target"
+    chmod +x "$target"
+
+    # Passe den Speicherort der Config in der installierten Datei auf /etc an
+    sed -i 's|CONFIG_FILE="$(dirname "$SCRIPT_PATH")/.restic_backup.json"|CONFIG_FILE="/etc/restic_backup.json"|' "$target"
+    sed -i 's|OLD_CONFIG_FILE="$(dirname "$SCRIPT_PATH")/.restic_backup.env"|OLD_CONFIG_FILE="/etc/restic_backup.env"|' "$target"
+
+    echo ">> ✔ Installation erfolgreich!"
+    echo ">> Du kannst das Backup-Tool ab sofort von überall mit dem Befehl 'restic-backup' starten."
+    echo ">> Die Konfigurationsdatei wird fortan unter '/etc/restic_backup.json' gespeichert."
+    exit 0
+}
+
+# ==========================================
 # Hilfe
 # ==========================================
 show_help() {
@@ -1852,13 +1877,17 @@ NUTZUNG:  $S [FLAGS]    (Flags kombinierbar)
          Entfernt Sperrdateien nach Absturz / Kill
          Betrifft alle aktiven Repos (Main + aktive Copies)
 
-  -i   Repository initialisieren / prüfen
+  -I   Repository initialisieren / prüfen
          Erstellt Repo-Struktur falls nicht vorhanden
          Betrifft alle aktiven Repos
          Sicher: bei bestehendem Repo passiert nichts
 
 ── SYSTEM ─────────────────────────────────────────────────
-  -s   TUI-Einstellungsmenü   (benötigt sudo)
+  -i   Skript systemweit installieren       <-- NEU HINZUFÜGEN
+         Kopiert das Skript nach /usr/local/bin/restic-backup
+         Verschiebt den Config-Pfad nach /etc/restic_backup.json
+
+  -s   TUI-Einstellungsmenü  (benötigt sudo)
          Vollständiges Menü für alle Einstellungen:
          • Backup starten (alle Modi)
          • Snapshots anzeigen (dieser Host / alle Hosts)
@@ -1932,11 +1961,13 @@ if [ $# -eq 0 ]; then
     show_help
 fi
 
-while getopts "hsfexrdnuliL" opt; do
+# getopts string anpassen: 'i' für Install, 'I' für Init
+while getopts "hsfexrdnuIiLl" opt; do
     case $opt in
         h) show_help ;;
         s) SHOW_SETTINGS=true; RUN_BACKUP=false ;;
-        i) INIT_REPO=true;     RUN_BACKUP=false ;;
+        I) INIT_REPO=true;     RUN_BACKUP=false ;; # Großes I für Init
+        i) install_script ;;                       # Kleines i für Install (ruft die neue Funktion auf)
         r) RUN_BACKUP=true ;;
         f) FULL_RESOURCES=true;  RUN_BACKUP=true ;;
         e) ECONOMY_MODE=true;    RUN_BACKUP=true ;;
