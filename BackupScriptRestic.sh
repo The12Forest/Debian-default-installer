@@ -1813,6 +1813,20 @@ install_script() {
     cp "$SCRIPT_PATH" "$target"
     chmod +x "$target"
 
+    # Kopiere bestehende Konfigurationen, falls vorhanden
+    if [ -f "$CONFIG_FILE" ]; then
+        echo ">> Kopiere bestehende Konfiguration nach /etc/restic_backup.json ..."
+        cp "$CONFIG_FILE" "/etc/restic_backup.json"
+        chmod 600 "/etc/restic_backup.json"
+    fi
+
+    # Falls noch eine ganz alte .env Datei existiert
+    if [ -f "$OLD_CONFIG_FILE" ]; then
+        echo ">> Kopiere alte .env Konfiguration nach /etc/restic_backup.env ..."
+        cp "$OLD_CONFIG_FILE" "/etc/restic_backup.env"
+        chmod 600 "/etc/restic_backup.env"
+    fi
+
     # Passe den Speicherort der Config in der installierten Datei auf /etc an
     sed -i 's|CONFIG_FILE="$(dirname "$SCRIPT_PATH")/.restic_backup.json"|CONFIG_FILE="/etc/restic_backup.json"|' "$target"
     sed -i 's|OLD_CONFIG_FILE="$(dirname "$SCRIPT_PATH")/.restic_backup.env"|OLD_CONFIG_FILE="/etc/restic_backup.env"|' "$target"
