@@ -1897,7 +1897,7 @@ NUTZUNG:  $S [FLAGS]    (Flags kombinierbar)
          Sicher: bei bestehendem Repo passiert nichts
 
 ── SYSTEM ─────────────────────────────────────────────────
-  -i   Skript systemweit installieren       <-- NEU HINZUFÜGEN
+  -i   Skript systemweit installieren
          Kopiert das Skript nach /usr/local/bin/restic-backup
          Verschiebt den Config-Pfad nach /etc/restic_backup.json
 
