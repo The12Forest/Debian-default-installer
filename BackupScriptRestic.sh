@@ -930,24 +930,24 @@ edit_repo_config() {
     while true; do
         clear
         local r_type
-        r_type=$(jq -r "${jq_path}.type // "unbekannt"" "$CONFIG_FILE")
+        r_type=$(jq -r "${jq_path}.type // \"\"" "$CONFIG_FILE")
 
         # Alle Felder je nach Typ lesen
         local v_user v_host v_path v_bucket v_url v_username v_bpass
         local v_pwd_set v_ssh_set v_ak v_sk v_kid v_bk
-        v_user=$(jq -r     "${jq_path}.user               // """ "$CONFIG_FILE")
-        v_host=$(jq -r     "${jq_path}.host               // """ "$CONFIG_FILE")
-        v_path=$(jq -r     "${jq_path}.path               // """ "$CONFIG_FILE")
-        v_bucket=$(jq -r   "${jq_path}.bucket             // """ "$CONFIG_FILE")
-        v_url=$(jq -r      "${jq_path}.url                // """ "$CONFIG_FILE")
-        v_username=$(jq -r "${jq_path}.username           // """ "$CONFIG_FILE")
-        v_bpass=$(jq -r    "${jq_path}.basic_password     // """ "$CONFIG_FILE")
-        v_ak=$(jq -r       "${jq_path}.env.AWS_ACCESS_KEY_ID     // """ "$CONFIG_FILE")
-        v_sk=$(jq -r       "${jq_path}.env.AWS_SECRET_ACCESS_KEY // """ "$CONFIG_FILE")
-        v_kid=$(jq -r      "${jq_path}.env.B2_ACCOUNT_ID  // """ "$CONFIG_FILE")
-        v_bk=$(jq -r       "${jq_path}.env.B2_ACCOUNT_KEY // """ "$CONFIG_FILE")
-        local pwd_raw; pwd_raw=$(jq -r "${jq_path}.password      // """ "$CONFIG_FILE")
-        local ssh_raw; ssh_raw=$(jq -r "${jq_path}.env.SSHPASS   // """ "$CONFIG_FILE")
+        v_user=$(jq -r     "${jq_path}.user               // \"\"" "$CONFIG_FILE")
+        v_host=$(jq -r     "${jq_path}.host               // \"\"" "$CONFIG_FILE")
+        v_path=$(jq -r     "${jq_path}.path               // \"\"" "$CONFIG_FILE")
+        v_bucket=$(jq -r   "${jq_path}.bucket             // \"\"" "$CONFIG_FILE")
+        v_url=$(jq -r      "${jq_path}.url                // \"\"" "$CONFIG_FILE")
+        v_username=$(jq -r "${jq_path}.username           // \"\"" "$CONFIG_FILE")
+        v_bpass=$(jq -r    "${jq_path}.basic_password     // \"\"" "$CONFIG_FILE")
+        v_ak=$(jq -r       "${jq_path}.env.AWS_ACCESS_KEY_ID     // \"\"" "$CONFIG_FILE")
+        v_sk=$(jq -r       "${jq_path}.env.AWS_SECRET_ACCESS_KEY // \"\"" "$CONFIG_FILE")
+        v_kid=$(jq -r      "${jq_path}.env.B2_ACCOUNT_ID  // \"\"" "$CONFIG_FILE")
+        v_bk=$(jq -r       "${jq_path}.env.B2_ACCOUNT_KEY // \"\"" "$CONFIG_FILE")
+        local pwd_raw; pwd_raw=$(jq -r "${jq_path}.password      // \"\"" "$CONFIG_FILE")
+        local ssh_raw; ssh_raw=$(jq -r "${jq_path}.env.SSHPASS   // \"\"" "$CONFIG_FILE")
         local v_pwd_str v_ssh_str v_ak_str v_sk_str v_kid_str v_bk_str v_bp_str
         [ -n "$pwd_raw" ] && v_pwd_str="$(col_ok '✔ gesetzt')"   || v_pwd_str="$(col_err '✘ fehlt')"
         [ -n "$ssh_raw" ] && v_ssh_str="$(col_ok '✔ gesetzt')"   || v_ssh_str="$(col_err '✘ fehlt')"
@@ -1050,7 +1050,7 @@ edit_repo_config() {
                     wizard_repo_input "" "$jq_path"
                     local new_json="$TUI_RESULT"
                     local pres_name pres_enabled
-                    pres_name=$(jq -r     "${jq_path}.name    // """ "$CONFIG_FILE")
+                    pres_name=$(jq -r     "${jq_path}.name    // \"\"" "$CONFIG_FILE")
                     pres_enabled=$(jq_bool "${jq_path}.enabled"        "$CONFIG_FILE")
                     if [ -n "$pres_name" ] && [ "$pres_name" != "null" ]; then
                         new_json=$(printf '%s' "$new_json" | jq --arg n "$pres_name" '. + {name:$n}')
@@ -1834,6 +1834,20 @@ install_script() {
     echo ">> ✔ Installation erfolgreich!"
     echo ">> Du kannst das Backup-Tool ab sofort von überall mit dem Befehl 'restic-backup' starten."
     echo ">> Die Konfigurationsdatei wird fortan unter '/etc/restic_backup.json' gespeichert."
+
+    # Alias-Option
+    echo ""
+    read -rp ">> Möchtest du einen zusätzlichen Alias-Befehl einrichten? (leer = nein): " alias_name
+    if [ -n "$alias_name" ]; then
+        local alias_target="/usr/local/bin/$alias_name"
+        if [ -e "$alias_target" ]; then
+            echo ">> WARNUNG: '$alias_target' existiert bereits und wird nicht überschrieben."
+        else
+            ln -s "$target" "$alias_target"
+            echo ">> ✔ Alias '$alias_name' -> '$target' eingerichtet."
+            echo ">> Du kannst das Tool nun auch mit '$alias_name' starten."
+        fi
+    fi
     exit 0
 }
 
