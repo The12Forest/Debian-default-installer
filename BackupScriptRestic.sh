@@ -1,4 +1,5 @@
 #!/bin/bash
+export HOME="${HOME:-/root}"
 
 # =============================================================================
 # Restic Multi-Repo Backup Script v2.0
@@ -20,6 +21,11 @@ EXTRA_RESOURCES=false
 DRY_RUN_FLAG=""
 NO_COMPRESSION=false
 
+DEFAULT_EXCLUDES=(
+    "/proc" "/sys" "/dev" "/run" "/tmp"
+    "/var/tmp" "/mnt" "/media" "/lost+found"
+)
+
 TUI_RESULT=""
 REPO_URL=""
 REPO_PW_FILE=""
@@ -30,6 +36,11 @@ MAIN_OPTS=()
 MAIN_TYPE=""
 MAIN_USER_VAR=""
 MAIN_HOST_VAR=""
+
+# Globals for shutdown trap — track currently active repo
+CURRENT_REPO_URL=""
+CURRENT_REPO_PW_FILE=""
+CURRENT_REPO_OPTS=()
 
 # ==========================================
 # Farb-Konstanten (ANSI)
@@ -191,6 +202,31 @@ jq_bool() {
     [ "$raw" = "false" ] && echo "false" || echo "true"
 }
 
+# Consistent hostname resolution: config file first, then system hostname
+get_hostname() {
+    local h; h=$(jq -r '.host // ""' "$CONFIG_FILE" 2>/dev/null)
+    if [ -z "$h" ] || [ "$h" = "null" ]; then
+        h=$(hostname 2>/dev/null || echo "unknown")
+    fi
+    printf '%s' "$h"
+}
+
+# Builds --exclude=... args from config (.excludes array), falls back to DEFAULT_EXCLUDES.
+# Result is written into the RESTIC_EXCLUDE_ARGS array (caller must declare it).
+build_exclude_args() {
+    RESTIC_EXCLUDE_ARGS=()
+    local count; count=$(jq '.excludes | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    if [ "$count" -gt 0 ]; then
+        while IFS= read -r path; do
+            RESTIC_EXCLUDE_ARGS+=("--exclude=$path")
+        done < <(jq -r '.excludes[]' "$CONFIG_FILE" 2>/dev/null)
+    else
+        for path in "${DEFAULT_EXCLUDES[@]}"; do
+            RESTIC_EXCLUDE_ARGS+=("--exclude=$path")
+        done
+    fi
+}
+
 # ==========================================
 # Migration: .env -> .json
 # ==========================================
@@ -210,6 +246,9 @@ migrate_env_to_json() {
           '{
             host: $host,
             compression: "auto",
+            retry_lock: "5m",
+            cache_dir: "~/.cache/restic",
+            lock_state: { last_seen: "", last_unlock_attempt: "" },
             notifications: { ntfy: { enabled: false } },
             main: {
               type: "sftp", user: $u, host: $h, path: $p,
@@ -224,11 +263,10 @@ migrate_env_to_json() {
     fi
 }
 
-# ==========================================
-# Fehler-Benachrichtigung (ntfy.sh)
-# ==========================================
+# notify_error <exit_code> <action_label> [error_log] [category]
+# Categories: backup, network, lock, cache, shutdown, unlock
 notify_error() {
-    local exit_code="$1" action_label="$2" error_log="${3:-}"
+    local exit_code="$1" action_label="$2" error_log="${3:-}" category="${4:-backup}"
     local ntfy_enabled
     ntfy_enabled=$(jq_bool '.notifications.ntfy.enabled' "$CONFIG_FILE")
     [ "$ntfy_enabled" != "true" ] && return 0
@@ -242,15 +280,62 @@ notify_error() {
     local auth_args=()
     [ -n "$ntfy_user" ] && [ -n "$ntfy_pass" ] && auth_args+=(-u "${ntfy_user}:${ntfy_pass}")
 
+    local host; host=$(get_hostname)
+
+    # Title and tags by category
+    local title tags
+    case "$category" in
+        network)
+            title="Backup Netzwerk-Fehler: ${host}"
+            tags="warning,no_entry"
+            ;;
+        lock)
+            title="Backup Repo gesperrt: ${host}"
+            tags="warning,lock"
+            ;;
+        cache)
+            title="Backup Cache-Fehler: ${host}"
+            tags="warning,file_folder"
+            ;;
+        shutdown)
+            title="Backup unterbrochen: ${host}"
+            tags="warning,zzz"
+            ;;
+        unlock)
+            title="Backup Auto-Unlock: ${host}"
+            tags="unlocked,information_source"
+            ;;
+        *)
+            title="Backup Fehler: ${host}"
+            tags="warning,skull"
+            ;;
+    esac
+
     local msg="Restic Fehler (${exit_code}) bei: ${action_label}"
     if [ -n "$error_log" ] && [ -f "$error_log" ]; then
         msg+=$'\n\nLetzte Log-Einträge:\n'"$(tail -n 10 "$error_log")"
     fi
 
     curl -s -o /dev/null "${auth_args[@]}" \
-        -H "Title: Backup Alert" -H "Tags: warning,skull" \
+        -H "Title: ${title}" -H "Tags: ${tags}" \
         -d "$msg" "${ntfy_url}/${ntfy_topic}" || true
 }
+
+# Loads --retry-lock and --cache-dir into RESTIC_EXTRA_OPTS array
+# Call once before running restic commands
+load_restic_extra_opts() {
+    RESTIC_EXTRA_OPTS=()
+    local retry_lock; retry_lock=$(jq -r '.retry_lock // "5m"' "$CONFIG_FILE" 2>/dev/null || echo "5m")
+    RESTIC_EXTRA_OPTS+=(--retry-lock "$retry_lock")
+
+    local cache_dir; cache_dir=$(jq -r '.cache_dir // "~/.cache/restic"' "$CONFIG_FILE" 2>/dev/null || echo "~/.cache/restic")
+    if [ -n "$cache_dir" ] && [ "$cache_dir" != "~/.cache/restic" ]; then
+        cache_dir="${cache_dir/#\~/$HOME}"
+        RESTIC_EXTRA_OPTS+=(--cache-dir "$cache_dir")
+    fi
+}
+
+RESTIC_EXTRA_OPTS=()
 
 # ==========================================
 # Restic-Ausfuehrung mit Fehlerbehandlung
@@ -260,12 +345,108 @@ run_restic() {
     local tmp_log; tmp_log=$(mktemp)
     if ! "$@" 2> >(tee "$tmp_log" >&2); then
         local rc=$?
-        notify_error "$rc" "$label" "$tmp_log"
+        local stderr; stderr=$(cat "$tmp_log" 2>/dev/null)
+
+        # Detect error category from stderr patterns
+        local category="backup"
+        if echo "$stderr" | grep -qiE "no route to host|connection refused|connection timed out|network is unreachable|temporary failure in name resolution|i/o timeout|connection reset by peer|broken pipe|name or service not known|could not resolve host"; then
+            category="network"
+            echo ">> NETZWERK-FEHLER erkannt. Backup wird sauber beendet — Timer läuft beim nächsten Mal weiter."
+        elif echo "$stderr" | grep -qiE "cache|cache directory|unable to create cache|cache dir"; then
+            category="cache"
+            echo ">> CACHE-FEHLER erkannt."
+        elif echo "$stderr" | grep -qiE "already locked|repository is already locked|unable to create lock|lock exists"; then
+            category="lock"
+            echo ">> REPO GESPERRT — Lock besteht bereits."
+            record_lock_detected
+        fi
+
+        notify_error "$rc" "$label" "$tmp_log" "$category"
         rm -f "$tmp_log"
         return $rc
     fi
     rm -f "$tmp_log"
     return 0
+}
+
+# ==========================================
+# Shutdown-Trap: Repo entsperren beim Herunterfahren
+# ==========================================
+cleanup_on_shutdown() {
+    echo ""
+    echo "=========================================="
+    echo ">> SYSTEM SHUTDOWN erkannt! Entsperre Repos..."
+    echo "=========================================="
+    local retry_lock; retry_lock=$(jq -r '.retry_lock // "5m"' "$CONFIG_FILE" 2>/dev/null || echo "5m")
+
+    if [ -n "$CURRENT_REPO_URL" ] && [ -n "$CURRENT_REPO_PW_FILE" ]; then
+        echo ">> Entsperre aktives Repo..."
+        restic --retry-lock "$retry_lock" "${CURRENT_REPO_OPTS[@]}" -r "$CURRENT_REPO_URL" \
+            --password-file "$CURRENT_REPO_PW_FILE" unlock 2>/dev/null || true
+    fi
+    if [ -n "$MAIN_URL" ] && [ -n "$MAIN_PW_FILE" ] && [ "$MAIN_URL" != "$CURRENT_REPO_URL" ]; then
+        echo ">> Entsperre Main-Repo..."
+        restic --retry-lock "$retry_lock" "${MAIN_OPTS[@]}" -r "$MAIN_URL" \
+            --password-file "$MAIN_PW_FILE" unlock 2>/dev/null || true
+    fi
+
+    notify_error 0 "Backup durch System-Shutdown unterbrochen" "" "shutdown"
+    echo ">> Repos entsperrt. Skript wird beendet."
+    exit 0
+}
+
+# ==========================================
+# Auto-Unlock: Repo entsperren wenn >24h gesperrt
+# ==========================================
+auto_unlock_if_stale() {
+    local last_seen last_unlock
+    last_seen=$(jq -r '.lock_state.last_seen // ""' "$CONFIG_FILE" 2>/dev/null)
+    last_unlock=$(jq -r '.lock_state.last_unlock_attempt // ""' "$CONFIG_FILE" 2>/dev/null)
+
+    # Kein vorheriger Lock erkannt → nichts zu tun
+    [ -z "$last_seen" ] || [ "$last_seen" = "null" ] && return 0
+
+    # Bereits nach dem letzten Lock entsperrt → nichts zu tun
+    if [ -n "$last_unlock" ] && [ "$last_unlock" != "null" ]; then
+        local unlock_ts seen_ts
+        unlock_ts=$(date -d "$last_unlock" +%s 2>/dev/null || echo 0)
+        seen_ts=$(date -d "$last_seen" +%s 2>/dev/null || echo 0)
+        [ "$unlock_ts" -gt "$seen_ts" ] && return 0
+    fi
+
+    # Prüfe ob der Lock älter als 24h ist
+    local now_ts seen_ts
+    now_ts=$(date +%s)
+    seen_ts=$(date -d "$last_seen" +%s 2>/dev/null || echo 0)
+    local age_hours=$(( (now_ts - seen_ts) / 3600 ))
+    [ "$age_hours" -lt 24 ] && return 0
+
+    echo ">> Repo seit ${age_hours}h gesperrt (>24h). Versuche Auto-Unlock..."
+    local retry_lock; retry_lock=$(jq -r '.retry_lock // "5m"' "$CONFIG_FILE" 2>/dev/null || echo "5m")
+
+    # Unlock main repo
+    if load_repo_context "main"; then
+        if restic --retry-lock "$retry_lock" "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" \
+            -r "$REPO_URL" --password-file "$REPO_PW_FILE" unlock 2>/dev/null; then
+            echo ">> Main-Repo erfolgreich entsperrt (Auto-Unlock nach ${age_hours}h)."
+        else
+            echo ">> WARNUNG: Auto-Unlock des Main-Repos fehlgeschlagen."
+        fi
+        cleanup_repo_context
+    fi
+
+    # Update timestamp
+    local now_iso; now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    config_set_arg '.lock_state.last_unlock_attempt = $val' "$now_iso"
+
+    local host; host=$(get_hostname)
+    notify_error 0 "Repo war ${age_hours}h gesperrt — Auto-Unlock durchgeführt" "" "unlock"
+}
+
+# Track lock detection in JSON for stale lock detection
+record_lock_detected() {
+    local now_iso; now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    config_set_arg '.lock_state.last_seen = $val' "$now_iso" 2>/dev/null || true
 }
 
 # ==========================================
@@ -381,6 +562,15 @@ run_backup() {
         exit 1
     fi
 
+    # Trap setzen: bei Shutdown/SIGTERM Repos entsperren
+    trap cleanup_on_shutdown SIGTERM SIGINT SIGHUP
+
+    # Extra-Opts laden (--retry-lock, --cache-dir)
+    load_restic_extra_opts
+
+    # Auto-Unlock falls Repo >24h gesperrt war
+    auto_unlock_if_stale
+
     # Kompressions-Einstellung
     local conf_compression; conf_compression=$(jq -r '.compression // "auto"' "$CONFIG_FILE")
     local RESTIC_SPEED_OPTS=()
@@ -435,19 +625,27 @@ run_backup() {
     chmod 600 "$MAIN_PW_FILE"
     MAIN_OPTS=("${REPO_OPTS[@]}")
 
+    local RESTIC_EXCLUDE_ARGS=()
+    build_exclude_args
+
+    # Track active repo for shutdown trap
+    CURRENT_REPO_URL="$REPO_URL"
+    CURRENT_REPO_PW_FILE="$REPO_PW_FILE"
+    CURRENT_REPO_OPTS=("${REPO_OPTS[@]}")
+
     run_restic "backup main" $NICE_PREFIX restic \
+        "${RESTIC_EXTRA_OPTS[@]}" \
         "${REPO_OPTS[@]}" \
         -r "$REPO_URL" \
         --password-file "$REPO_PW_FILE" \
         backup / \
         "${RESTIC_HOST_OPT[@]}" \
-        --exclude="/proc"        --exclude="/sys"       --exclude="/dev" \
-        --exclude="/run"         --exclude="/tmp"        --exclude="/var/tmp" \
-        --exclude="/mnt"         --exclude="/media"      --exclude="/lost+found" \
+        "${RESTIC_EXCLUDE_ARGS[@]}" \
         "${RESTIC_SPEED_OPTS[@]}" \
         "${DRY_RUN_ARGS[@]}"
 
     run_restic "forget main" $NICE_PREFIX restic \
+        "${RESTIC_EXTRA_OPTS[@]}" \
         "${REPO_OPTS[@]}" \
         -r "$REPO_URL" \
         --password-file "$REPO_PW_FILE" \
@@ -485,7 +683,7 @@ run_backup() {
             fi
 
             # Initialisiere Copy-Repo (Fehler ignorieren = existiert bereits)
-            restic "${REPO_OPTS[@]}" -r "$REPO_URL" \
+            restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" -r "$REPO_URL" \
                 --password-file "$REPO_PW_FILE" init &>/dev/null || true
 
             # ------------------------------------------------------------------
@@ -532,7 +730,13 @@ run_backup() {
                 fi
             fi
 
+            # Track copy repo for shutdown trap
+            CURRENT_REPO_URL="$REPO_URL"
+            CURRENT_REPO_PW_FILE="$REPO_PW_FILE"
+            CURRENT_REPO_OPTS=("${COPY_REPO_OPTS[@]}")
+
             run_restic "copy -> $c_name" $NICE_PREFIX restic \
+                "${RESTIC_EXTRA_OPTS[@]}" \
                 "${COPY_REPO_OPTS[@]}" \
                 -r "$REPO_URL" \
                 --password-file "$REPO_PW_FILE" \
@@ -557,6 +761,13 @@ run_backup() {
     fi
 
     rm -f "$MAIN_PW_FILE" 2>/dev/null || true
+
+    # Shutdown-Trap entfernen — Backup ist normal beendet
+    trap - SIGTERM SIGINT SIGHUP
+    CURRENT_REPO_URL=""
+    CURRENT_REPO_PW_FILE=""
+    CURRENT_REPO_OPTS=()
+
     echo ""
     echo ">> Backup-Vorgang abgeschlossen."
     [[ -t 0 ]] && read -rp "Drücke Enter..."
@@ -570,6 +781,8 @@ run_action_all_repos() {
     local action="$1"
     require_jq
     migrate_env_to_json
+
+    load_restic_extra_opts
 
     local r_host; r_host=$(jq -r '.host // ""' "$CONFIG_FILE")
     # snapshots_all = alle Computer anzeigen (kein --host Filter)
@@ -594,13 +807,13 @@ run_action_all_repos() {
         echo ">> [MAIN REPO]"
         case "$action" in
             snapshots|snapshots_all)
-                restic "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" \
+                restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" \
                     snapshots "${RESTIC_HOST_OPT[@]}" ;;
             init)
-                restic "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" \
+                restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" \
                     init 2>/dev/null || echo "  (Repo existiert bereits)" ;;
             unlock)
-                restic "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" unlock ;;
+                restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" unlock ;;
         esac
         cleanup_repo_context
     else
@@ -617,13 +830,13 @@ run_action_all_repos() {
             echo ">> [$c_name]"
             case "$action" in
                 snapshots|snapshots_all)
-                    restic "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" \
+                    restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" \
                         snapshots "${RESTIC_HOST_OPT[@]}" ;;
                 init)
-                    restic "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" \
+                    restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" \
                         init 2>/dev/null || echo "  (Repo existiert bereits)" ;;
                 unlock)
-                    restic "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" unlock ;;
+                    restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" unlock ;;
             esac
             cleanup_repo_context
         fi
@@ -800,6 +1013,23 @@ do_setup_wizard() {
     tui_input "Kompressions-Modus" "$cur_comp" ""
     local r_comp="$TUI_RESULT"
 
+    # Retry-Lock
+    echo ""
+    echo "   --retry-lock Wartezeit:"
+    echo "   Wenn das Repo gesperrt ist (z.B. laufendes Backup), wartet restic"
+    echo "   bis zu dieser Zeit bevor es abbricht. Format: 30s, 5m, 1h"
+    local cur_retry="5m"; [ -f "$CONFIG_FILE" ] && cur_retry=$(jq -r '.retry_lock // "5m"' "$CONFIG_FILE")
+    tui_input "Retry-Lock Wartezeit" "$cur_retry" "Empfohlen: 5m (5 Minuten)"
+    local r_retry="$TUI_RESULT"
+
+    # Cache-Verzeichnis
+    echo ""
+    echo "   Cache-Verzeichnis für restic:"
+    echo "   Default: ~/.cache/restic (wird über HOME aufgelöst)"
+    local cur_cache="~/.cache/restic"; [ -f "$CONFIG_FILE" ] && cur_cache=$(jq -r '.cache_dir // "~/.cache/restic"' "$CONFIG_FILE")
+    tui_input "Cache-Verzeichnis" "$cur_cache" "Leer lassen für restic-Default (~/.cache/restic)"
+    local r_cache="$TUI_RESULT"
+
     # Main-Repo
     echo ""
     echo "--- Haupt-Repository ---"
@@ -852,18 +1082,23 @@ do_setup_wizard() {
     jq -n \
       --arg h     "$r_host" \
       --arg comp  "$r_comp" \
+      --arg retry "$r_retry" \
+      --arg cache "$r_cache" \
       --argjson main   "$main_json" \
       --argjson ntfy   "$njson" \
       --argjson copies "$existing_copies" \
-      '{host:$h, compression:$comp, notifications:{ntfy:$ntfy}, main:$main, copies:$copies}' \
+      '{host:$h, compression:$comp, retry_lock:$retry, cache_dir:$cache,
+        lock_state:{last_seen:"", last_unlock_attempt:""},
+        notifications:{ntfy:$ntfy}, main:$main, copies:$copies}' \
       > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
 
     echo ""
     echo ">> Konfiguration gespeichert: $CONFIG_FILE"
     echo ">> Initialisiere Repository..."
+    load_restic_extra_opts
     if load_repo_context "main"; then
-        if restic "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" init 2>/dev/null; then
+        if restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" init 2>/dev/null; then
             echo ">> Repository initialisiert."
         else
             echo ">> Hinweis: Repo existiert bereits oder Verbindung fehlgeschlagen."
@@ -907,10 +1142,11 @@ add_copy_repo_wizard() {
     echo ""
     echo ">> Copy-Repository '$r_name' hinzugefügt."
     echo ">> Initialisiere Repository..."
+    load_restic_extra_opts
     local new_idx; new_idx=$(jq '.copies | length' "$CONFIG_FILE")
     new_idx=$((new_idx - 1))
     if load_repo_context "$new_idx"; then
-        if restic "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" init 2>/dev/null; then
+        if restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" init 2>/dev/null; then
             echo ">> Repository initialisiert."
         else
             echo ">> Hinweis: Repo existiert bereits oder Verbindung fehlgeschlagen."
@@ -1175,13 +1411,13 @@ ntfy_send_test() {
     local auth_args=()
     [ -n "$ntfy_user" ] && [ -n "$ntfy_pass" ] && auth_args+=(-u "${ntfy_user}:${ntfy_pass}")
 
-    local host; host=$(jq -r '.host // "unbekannt"' "$CONFIG_FILE")
+    local host; host=$(get_hostname)
     local msg="Test-Nachricht von Restic Backup Manager auf '${host}'. Ntfy funktioniert korrekt!"
 
     echo "  >> Sende Test-Nachricht an ${ntfy_url}/${ntfy_topic} ..."
     local http_code
     http_code=$(curl -s -o /dev/null -w "%{http_code}" "${auth_args[@]}" \
-        -H "Title: Backup Test" \
+        -H "Title: Backup Test: ${host}" \
         -H "Tags: white_check_mark" \
         -H "Priority: default" \
         -d "$msg" \
@@ -1193,6 +1429,110 @@ ntfy_send_test() {
         echo "  >> FEHLER! HTTP $http_code — Bitte URL, Topic und Zugangsdaten prüfen."
     fi
     sleep 3
+}
+
+# ==========================================
+# TUI: Ordner-Ausschlüsse verwalten
+# ==========================================
+menu_exclude_settings() {
+    while true; do
+        clear
+        printf "${C_BOLD}╔══════════════════════════════════════════╗${C_RESET}\n"
+        printf "${C_BOLD}║    ORDNER-AUSSCHLÜSSE (Excludes)         ║${C_RESET}\n"
+        printf "${C_BOLD}╚══════════════════════════════════════════╝${C_RESET}\n"
+
+        local count; count=$(jq '.excludes | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+        local using_defaults=false
+        [ "$count" -eq 0 ] && using_defaults=true
+
+        if $using_defaults; then
+            printf "  ${C_DIM}(Keine eigene Liste — Standard-Excludes aktiv)${C_RESET}\n"
+            printf "${C_DIM}──────────────────────────────────────────${C_RESET}\n"
+            for i in "${!DEFAULT_EXCLUDES[@]}"; do
+                printf "  ${C_DIM}%2d)${C_RESET} %s\n" "$((i+1))" "${DEFAULT_EXCLUDES[$i]}"
+            done
+        else
+            printf "${C_DIM}──────────────────────────────────────────${C_RESET}\n"
+            local idx=0
+            while IFS= read -r path; do
+                printf "  ${C_BOLD}%2d)${C_RESET} %s\n" "$((idx+1))" "$path"
+                idx=$((idx+1))
+            done < <(jq -r '.excludes[]' "$CONFIG_FILE" 2>/dev/null)
+        fi
+
+        printf "${C_DIM}──────────────────────────────────────────${C_RESET}\n"
+        printf "  ${C_BOLD}A)${C_RESET}  Pfad hinzufügen\n"
+        if ! $using_defaults; then
+            printf "  ${C_BOLD}R)${C_RESET}  Pfad entfernen (Nummer eingeben)\n"
+        fi
+        printf "  ${C_BOLD}D)${C_RESET}  Auf Standard-Excludes zurücksetzen\n"
+        printf "  ${C_BOLD}0)${C_RESET}  Zurück\n"
+        printf "${C_DIM}──────────────────────────────────────────${C_RESET}\n"
+        read -rp "  Auswahl: " xchoice
+
+        case "$xchoice" in
+            [Aa])
+                tui_input "Pfad hinzufügen" "" "Vollständiger Pfad, z.B. /home/user/Downloads"
+                local new_path="$TUI_RESULT"
+                [ -z "$new_path" ] && continue
+                # Ensure the excludes array exists, then append
+                if $using_defaults; then
+                    # Initialise with defaults first
+                    local defaults_json; defaults_json=$(printf '%s\n' "${DEFAULT_EXCLUDES[@]}" | jq -R . | jq -s .)
+                    local tmp_file; tmp_file=$(mktemp)
+                    if jq --argjson arr "$defaults_json" '.excludes = $arr' "$CONFIG_FILE" > "$tmp_file"; then
+                        mv "$tmp_file" "$CONFIG_FILE"; chmod 600 "$CONFIG_FILE"
+                    else rm -f "$tmp_file"; fi
+                fi
+                config_set_arg '.excludes += [$val]' "$new_path"
+                printf "  ${C_GREEN}>> '%s' hinzugefügt.${C_RESET}\n" "$new_path"
+                sleep 1
+                ;;
+            [Rr])
+                $using_defaults && continue
+                read -rp "  Welche Nummer entfernen? " rnum
+                if [[ "$rnum" =~ ^[0-9]+$ ]]; then
+                    local ridx=$((rnum - 1))
+                    local cur_count; cur_count=$(jq '.excludes | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+                    if [ "$ridx" -ge 0 ] && [ "$ridx" -lt "$cur_count" ]; then
+                        local del_path; del_path=$(jq -r ".excludes[$ridx]" "$CONFIG_FILE")
+                        local tmp_file; tmp_file=$(mktemp)
+                        if jq "del(.excludes[$ridx])" "$CONFIG_FILE" > "$tmp_file"; then
+                            mv "$tmp_file" "$CONFIG_FILE"; chmod 600 "$CONFIG_FILE"
+                            printf "  ${C_GREEN}>> '%s' entfernt.${C_RESET}\n" "$del_path"
+                        else rm -f "$tmp_file"; printf "  ${C_RED}>> Fehler beim Entfernen.${C_RESET}\n"; fi
+                        sleep 1
+                    fi
+                fi
+                ;;
+            [Dd])
+                if tui_confirm "Eigene Liste löschen und Standard-Excludes verwenden?" "n"; then
+                    config_set 'del(.excludes)'
+                    printf "  ${C_GREEN}>> Zurückgesetzt auf Standard-Excludes.${C_RESET}\n"
+                    sleep 1
+                fi
+                ;;
+            0) return ;;
+            *)
+                # Allow direct number entry to remove a path
+                if [[ "$xchoice" =~ ^[0-9]+$ ]] && ! $using_defaults; then
+                    local ridx=$((xchoice - 1))
+                    local cur_count; cur_count=$(jq '.excludes | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+                    if [ "$ridx" -ge 0 ] && [ "$ridx" -lt "$cur_count" ]; then
+                        local del_path; del_path=$(jq -r ".excludes[$ridx]" "$CONFIG_FILE")
+                        if tui_confirm "  '$del_path' entfernen?" "n"; then
+                            local tmp_file; tmp_file=$(mktemp)
+                            if jq "del(.excludes[$ridx])" "$CONFIG_FILE" > "$tmp_file"; then
+                                mv "$tmp_file" "$CONFIG_FILE"; chmod 600 "$CONFIG_FILE"
+                                printf "  ${C_GREEN}>> Entfernt.${C_RESET}\n"
+                            else rm -f "$tmp_file"; fi
+                            sleep 1
+                        fi
+                    fi
+                fi
+                ;;
+        esac
+    done
 }
 
 # ==========================================
@@ -1219,15 +1559,24 @@ edit_global_settings() {
         echo ""
         echo "  2) Kompression:        $r_comp"
         echo "     (auto | max | off)"
+        echo ""
+        local r_retry r_cache
+        r_retry=$(jq -r '.retry_lock // "5m"' "$CONFIG_FILE")
+        r_cache=$(jq -r '.cache_dir // "~/.cache/restic"' "$CONFIG_FILE")
+        echo "  3) Retry-Lock Wartezeit:  $r_retry"
+        echo "     Wartezeit wenn Repo gesperrt ist (30s, 5m, 1h)"
+        echo ""
+        echo "  4) Cache-Verzeichnis:     $r_cache"
+        echo "     Pfad zum restic-Cache (~/.cache/restic = Default)"
         echo "------------------------------------------"
         echo "  Ntfy Push-Benachrichtigungen: [$ntfy_status_str]"
-        echo "  3) Aktiviert:          $ntfy_en"
-        echo "  4) Server URL:         $ntfy_url"
-        echo "  5) Topic:              $ntfy_topic"
-        echo "  6) Benutzer:           ${ntfy_user:-<keiner>}"
-        echo "  7) Passwort ändern:   ****"
+        echo "  5) Aktiviert:          $ntfy_en"
+        echo "  6) Server URL:         $ntfy_url"
+        echo "  7) Topic:              $ntfy_topic"
+        echo "  8) Benutzer:           ${ntfy_user:-<keiner>}"
+        echo "  9) Passwort andern:   ****"
         if [ "$ntfy_en" = "true" ]; then
-            echo "  8) Test-Nachricht senden"
+            echo " 10) Test-Nachricht senden"
         fi
         echo "------------------------------------------"
         echo "  0) Zurück"
@@ -1241,22 +1590,27 @@ edit_global_settings() {
             2) echo "   auto = Empfohlen | max = Kleiner aber langsamer | off = Keine Kompression"
                tui_input "Kompressions-Modus" "$r_comp" ""
                config_set_arg '.compression = $val' "$TUI_RESULT" ;;
-            3) if [ "$ntfy_en" = "true" ]; then
+            3) tui_input "Retry-Lock Wartezeit" "$r_retry" "Format: 30s, 5m, 1h (restic-Dauer)"
+               config_set_arg '.retry_lock = $val' "$TUI_RESULT" ;;
+            4) echo "   Default: ~/.cache/restic (ueber HOME aufgeloest)"
+               tui_input "Cache-Verzeichnis" "$r_cache" "Leer lassen fuer restic-Default"
+               config_set_arg '.cache_dir = $val' "$TUI_RESULT" ;;
+            5) if [ "$ntfy_en" = "true" ]; then
                    config_set '.notifications.ntfy.enabled = false'
                    echo "  >> Ntfy deaktiviert."
                else
                    config_set '.notifications.ntfy.enabled = true'
                    echo "  >> Ntfy aktiviert."
                fi; sleep 1 ;;
-            4) tui_input "Ntfy URL" "$ntfy_url" "URL des ntfy-Servers"
+            6) tui_input "Ntfy URL" "$ntfy_url" "URL des ntfy-Servers"
                config_set_arg '.notifications.ntfy.url = $val' "$TUI_RESULT" ;;
-            5) tui_input "Ntfy Topic" "$ntfy_topic" "Topic-Name (abonnierst du in der ntfy-App)"
+            7) tui_input "Ntfy Topic" "$ntfy_topic" "Topic-Name (abonnierst du in der ntfy-App)"
                config_set_arg '.notifications.ntfy.topic = $val' "$TUI_RESULT" ;;
-            6) tui_input "Ntfy Benutzer" "$ntfy_user" "Leer lassen wenn kein Auth benötigt"
+            8) tui_input "Ntfy Benutzer" "$ntfy_user" "Leer lassen wenn kein Auth benötigt"
                config_set_arg '.notifications.ntfy.username = $val' "$TUI_RESULT" ;;
-            7) tui_input "Ntfy Passwort" "" "Passwort für ntfy-Login" "true"
+            9) tui_input "Ntfy Passwort" "" "Passwort für ntfy-Login" "true"
                [ -n "$TUI_RESULT" ] && config_set_arg '.notifications.ntfy.password = $val' "$TUI_RESULT" ;;
-            8) if [ "$ntfy_en" = "true" ]; then
+            10) if [ "$ntfy_en" = "true" ]; then
                    ntfy_send_test
                fi ;;
             0) return ;;
@@ -1334,6 +1688,7 @@ menu_edit_configs() {
         done
 
         echo "------------------------------------------"
+        echo "  E) Ordner-Ausschlüsse bearbeiten"
         echo "  N) Neues Copy-Repository hinzufügen"
         echo "  D) Copy-Repository aus Konfig löschen"
         echo "  0) Zurück"
@@ -1343,6 +1698,7 @@ menu_edit_configs() {
         case "$echoice" in
             1)    edit_global_settings ;;
             2)    edit_repo_config ".main" "Main-Repository" ;;
+            [Ee]) menu_exclude_settings ;;
             [Nn]) add_copy_repo_wizard ;;
             [Dd]) menu_delete_copy_repo ;;
             0)    return ;;
@@ -1436,6 +1792,29 @@ menu_toggle_copies() {
 }
 
 # ==========================================
+# Service-Logs anzeigen
+# ==========================================
+view_service_logs() {
+    clear
+    echo "=========================================="
+    echo "   SERVICE LOGS (letzte 50 Zeilen)"
+    echo "=========================================="
+    if [ -f "$SYSTEMD_DIR/$SERVICE_NAME" ]; then
+        journalctl --no-pager -u "$SERVICE_NAME" -n 50 2>/dev/null || echo "  (keine Logs verfuegbar)"
+    else
+        echo "  Service nicht installiert."
+    fi
+    echo "------------------------------------------"
+    echo "  F) Logs live verfolgen (Ctrl+C zum Beenden)"
+    echo "  0) Zurueck"
+    read -rp "  Auswahl: " logchoice
+    if [[ "$logchoice" =~ ^[Ff]$ ]]; then
+        echo ">> Live-Log (Ctrl+C beenden)..."
+        journalctl -f -u "$SERVICE_NAME" 2>/dev/null
+    fi
+}
+
+# ==========================================
 # Systemd-Service-Management
 # ==========================================
 install_systemd_automatic() {
@@ -1450,6 +1829,7 @@ Type=oneshot
 ExecStart=$SCRIPT_PATH -f
 StandardOutput=journal
 StandardError=journal
+Environment="HOME=/root"
 EOF
 
     cat > "$SYSTEMD_DIR/$TIMER_NAME" << EOF
@@ -1547,6 +1927,9 @@ menu_ntfy_settings() {
             jq -n '{
                 host: "",
                 compression: "auto",
+                retry_lock: "5m",
+                cache_dir: "~/.cache/restic",
+                lock_state: { last_seen: "", last_unlock_attempt: "" },
                 notifications: { ntfy: { enabled: false } },
                 main: {},
                 copies: []
@@ -1752,12 +2135,14 @@ menu_settings() {
         printf "  ${C_BOLD}6)${C_RESET}  Ersteinrichtung neu starten\n"
         printf "  ${C_BOLD}7)${C_RESET}  Copy-Repos verwalten  ${C_DIM}(EIN/AUS/Löschen)${C_RESET}\n"
         printf "  ${C_BOLD}8)${C_RESET}  Neues Copy-Repository hinzufügen\n"
+        printf "  ${C_BOLD}E)${C_RESET}  Ordner-Ausschlüsse bearbeiten\n"
         printf "  ${C_BOLD}N)${C_RESET}  Ntfy-Benachrichtigungen konfigurieren\n"
         printf "${C_DIM}  ── Auto-Backup (systemd) ─────────────────${C_RESET}\n"
         printf "  ${C_BOLD}9)${C_RESET}  Auto-Backup Service installieren\n"
         printf " ${C_BOLD}10)${C_RESET}  Timer-Zeitplan anpassen\n"
         printf " ${C_BOLD}11)${C_RESET}  Auto-Backup ein-/ausschalten\n"
         printf " ${C_BOLD}12)${C_RESET}  Service komplett entfernen\n"
+        printf " ${C_BOLD}13)${C_RESET}  Service-Logs anzeigen\n"
         printf "${C_DIM}──────────────────────────────────────────${C_RESET}\n"
         printf "  ${C_BOLD}0)${C_RESET}  Beenden\n"
         printf "${C_DIM}──────────────────────────────────────────${C_RESET}\n"
@@ -1773,6 +2158,7 @@ menu_settings() {
             6)    do_setup_wizard ;;
             7)    menu_toggle_copies ;;
             8)    add_copy_repo_wizard ;;
+            [Ee]) menu_exclude_settings ;;
             [Nn]) menu_ntfy_settings ;;
             9)    install_systemd_automatic ;;
             10)   update_timer_settings ;;
@@ -1793,6 +2179,7 @@ menu_settings() {
                     printf "${C_GREEN}>> Service entfernt.${C_RESET}\n"
                     sleep 1
                 fi ;;
+            13) view_service_logs ;;
             0) exit 0 ;;
         esac
     done
