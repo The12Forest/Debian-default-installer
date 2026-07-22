@@ -321,12 +321,33 @@ notify_error() {
         -d "$msg" "${ntfy_url}/${ntfy_topic}" || true
 }
 
+# Check if restic supports --retry-lock (added in restic 0.16.0)
+restic_supports_retry_lock() {
+    local ver; ver=$(restic version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [ -z "$ver" ]; then return 1; fi
+    local major minor
+    major=$(echo "$ver" | cut -d. -f1)
+    minor=$(echo "$ver" | cut -d. -f2)
+    [ "$major" -gt 0 ] || { [ "$major" -eq 0 ] && [ "$minor" -ge 16 ]; }
+}
+
+# Returns full restic version string (e.g. "restic 0.17.0") or "nicht installiert"
+get_restic_version() {
+    if command -v restic &>/dev/null; then
+        restic version 2>/dev/null | head -1
+    else
+        echo "nicht installiert"
+    fi
+}
+
 # Loads --retry-lock and --cache-dir into RESTIC_EXTRA_OPTS array
 # Call once before running restic commands
 load_restic_extra_opts() {
     RESTIC_EXTRA_OPTS=()
-    local retry_lock; retry_lock=$(jq -r '.retry_lock // "5m"' "$CONFIG_FILE" 2>/dev/null || echo "5m")
-    RESTIC_EXTRA_OPTS+=(--retry-lock "$retry_lock")
+    if restic_supports_retry_lock; then
+        local retry_lock; retry_lock=$(jq -r '.retry_lock // "5m"' "$CONFIG_FILE" 2>/dev/null || echo "5m")
+        RESTIC_EXTRA_OPTS+=(--retry-lock "$retry_lock")
+    fi
 
     local cache_dir; cache_dir=$(jq -r '.cache_dir // "~/.cache/restic"' "$CONFIG_FILE" 2>/dev/null || echo "~/.cache/restic")
     if [ -n "$cache_dir" ] && [ "$cache_dir" != "~/.cache/restic" ]; then
@@ -378,15 +399,17 @@ cleanup_on_shutdown() {
     echo ">> SYSTEM SHUTDOWN erkannt! Entsperre Repos..."
     echo "=========================================="
     local retry_lock; retry_lock=$(jq -r '.retry_lock // "5m"' "$CONFIG_FILE" 2>/dev/null || echo "5m")
+    local RETRY_ARR=()
+    restic_supports_retry_lock && RETRY_ARR=(--retry-lock "$retry_lock")
 
     if [ -n "$CURRENT_REPO_URL" ] && [ -n "$CURRENT_REPO_PW_FILE" ]; then
         echo ">> Entsperre aktives Repo..."
-        restic --retry-lock "$retry_lock" "${CURRENT_REPO_OPTS[@]}" -r "$CURRENT_REPO_URL" \
+        restic "${RETRY_ARR[@]}" "${CURRENT_REPO_OPTS[@]}" -r "$CURRENT_REPO_URL" \
             --password-file "$CURRENT_REPO_PW_FILE" unlock 2>/dev/null || true
     fi
     if [ -n "$MAIN_URL" ] && [ -n "$MAIN_PW_FILE" ] && [ "$MAIN_URL" != "$CURRENT_REPO_URL" ]; then
         echo ">> Entsperre Main-Repo..."
-        restic --retry-lock "$retry_lock" "${MAIN_OPTS[@]}" -r "$MAIN_URL" \
+        restic "${RETRY_ARR[@]}" "${MAIN_OPTS[@]}" -r "$MAIN_URL" \
             --password-file "$MAIN_PW_FILE" unlock 2>/dev/null || true
     fi
 
@@ -422,11 +445,10 @@ auto_unlock_if_stale() {
     [ "$age_hours" -lt 24 ] && return 0
 
     echo ">> Repo seit ${age_hours}h gesperrt (>24h). Versuche Auto-Unlock..."
-    local retry_lock; retry_lock=$(jq -r '.retry_lock // "5m"' "$CONFIG_FILE" 2>/dev/null || echo "5m")
 
     # Unlock main repo
     if load_repo_context "main"; then
-        if restic --retry-lock "$retry_lock" "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" \
+        if restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" \
             -r "$REPO_URL" --password-file "$REPO_PW_FILE" unlock 2>/dev/null; then
             echo ">> Main-Repo erfolgreich entsperrt (Auto-Unlock nach ${age_hours}h)."
         else
@@ -1792,6 +1814,86 @@ menu_toggle_copies() {
 }
 
 # ==========================================
+# Restic-Update (distributionsuebergreifend)
+# ==========================================
+update_restic() {
+    clear
+    echo "=========================================="
+    echo "   RESTIC UPDATE"
+    echo "=========================================="
+    local current; current=$(get_restic_version)
+    echo "  Aktuelle Version: $current"
+    echo ""
+
+    if ! command -v restic &>/dev/null; then
+        echo ">> Restic ist nicht installiert. Bitte zuerst installieren:"
+        echo "   https://restic.net  oder  sudo apt install restic"
+        sleep 3; return
+    fi
+
+    # 1. Versuch: System-Paketmanager
+    echo ">> Versuche Update via System-Paketmanager..."
+
+    if command -v apt-get &>/dev/null; then
+        echo "   (apt-get update && apt-get install --only-upgrade restic)"
+        apt-get update -qq && apt-get install --only-upgrade -y restic 2>/dev/null && {
+            echo ">> Update via apt erfolgreich."
+            echo "   Neue Version: $(get_restic_version)"
+            sleep 2; return
+        }
+    elif command -v dnf &>/dev/null; then
+        echo "   (dnf upgrade restic)"
+        dnf upgrade -y restic 2>/dev/null && {
+            echo ">> Update via dnf erfolgreich."
+            echo "   Neue Version: $(get_restic_version)"
+            sleep 2; return
+        }
+    elif command -v pacman &>/dev/null; then
+        echo "   (pacman -Sy restic)"
+        pacman -Sy --noconfirm restic 2>/dev/null && {
+            echo ">> Update via pacman erfolgreich."
+            echo "   Neue Version: $(get_restic_version)"
+            sleep 2; return
+        }
+    elif command -v zypper &>/dev/null; then
+        echo "   (zypper update restic)"
+        zypper update -y restic 2>/dev/null && {
+            echo ">> Update via zypper erfolgreich."
+            echo "   Neue Version: $(get_restic_version)"
+            sleep 2; return
+        }
+    elif command -v apk &>/dev/null; then
+        echo "   (apk update && apk add restic)"
+        apk update && apk add --upgrade restic 2>/dev/null && {
+            echo ">> Update via apk erfolgreich."
+            echo "   Neue Version: $(get_restic_version)"
+            sleep 2; return
+        }
+    fi
+
+    # 2. Versuch: restic self-update (fuer Binary-Installationen)
+    echo ""
+    echo ">> Paketmanager-Update nicht erfolgreich/verfuegbar."
+    if restic_supports_retry_lock; then
+        echo ">> Versuche restic self-update..."
+        if restic self-update 2>/dev/null; then
+            echo ">> Self-update erfolgreich."
+            echo "   Neue Version: $(get_restic_version)"
+            sleep 2; return
+        else
+            echo ">> Self-update fehlgeschlagen (kein Schreibzugriff auf Binary?)."
+            echo "   Manuelles Update: https://github.com/restic/restic/releases/latest"
+        fi
+    else
+        echo ">> restic self-update erst ab v0.15.0 verfuegbar."
+        echo ">> Bitte manuell updaten: https://github.com/restic/restic/releases/latest"
+        echo "   Oder via Paketmanager: sudo apt install restic"
+    fi
+
+    sleep 3
+}
+
+# ==========================================
 # Service-Logs anzeigen
 # ==========================================
 view_service_logs() {
@@ -2114,6 +2216,16 @@ menu_settings() {
 
         # ── Status-Panel ─────────────────────────────────────────────────────
         printf "  ${C_BOLD}%-14s${C_RESET} %s\n"  "Host:"        "$(col_info "$r_host")"
+
+        local restic_ver_str restic_lock_ok
+        restic_ver_str=$(get_restic_version)
+        if restic_supports_retry_lock; then
+            restic_lock_ok="$(col_ok '(retry-lock ok)')"
+        else
+            restic_lock_ok="$(col_warn '(retry-lock fehlt)')"
+        fi
+        printf "  ${C_BOLD}%-14s${C_RESET} %s %s\n" "Restic:" "$(col_info "$restic_ver_str")" "$restic_lock_ok"
+
         printf "  ${C_BOLD}%-14s${C_RESET} %s\n"  "Kompression:" "$comp_str"
         printf "  ${C_BOLD}%-14s${C_RESET} %s\n"  "Main-Repo:"   "$main_str"
         printf "  ${C_BOLD}%-14s${C_RESET} %s\n"  "Copy-Repos:"  "$copy_str"
@@ -2130,6 +2242,7 @@ menu_settings() {
         printf "  ${C_BOLD}2)${C_RESET}  Snapshots ${C_BOLD}ALLER${C_RESET} Computer anzeigen\n"
         printf "  ${C_BOLD}3)${C_RESET}  Repositories entsperren  ${C_DIM}(nur aktive)${C_RESET}\n"
         printf "  ${C_BOLD}4)${C_RESET}  Repository-Init prüfen   ${C_DIM}(nur aktive)${C_RESET}\n"
+        printf "  ${C_BOLD}R)${C_RESET}  Restic updaten            ${C_DIM}(alle Distros)${C_RESET}\n"
         printf "${C_DIM}  ── Konfiguration ─────────────────────────${C_RESET}\n"
         printf "  ${C_BOLD}5)${C_RESET}  Konfiguration bearbeiten\n"
         printf "  ${C_BOLD}6)${C_RESET}  Ersteinrichtung neu starten\n"
@@ -2154,6 +2267,7 @@ menu_settings() {
             2)    run_action_all_repos "snapshots_all" ;;
             3)    run_action_all_repos "unlock" ;;
             4)    run_action_all_repos "init" ;;
+            [Rr]) update_restic ;;
             5)    menu_edit_configs ;;
             6)    do_setup_wizard ;;
             7)    menu_toggle_copies ;;
