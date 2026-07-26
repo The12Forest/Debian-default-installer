@@ -287,27 +287,27 @@ notify_error() {
     case "$category" in
         network)
             title="Backup Netzwerk-Fehler: ${host}"
-            tags="warning,no_entry"
+            tags="warning"
             ;;
         lock)
             title="Backup Repo gesperrt: ${host}"
-            tags="warning,lock"
+            tags="warning"
             ;;
         cache)
             title="Backup Cache-Fehler: ${host}"
-            tags="warning,file_folder"
+            tags="warning"
             ;;
         shutdown)
             title="Backup unterbrochen: ${host}"
-            tags="warning,zzz"
+            tags="warning"
             ;;
         unlock)
             title="Backup Auto-Unlock: ${host}"
-            tags="unlocked,information_source"
+            tags="information"
             ;;
         *)
             title="Backup Fehler: ${host}"
-            tags="warning,skull"
+            tags="warning"
             ;;
     esac
 
@@ -338,6 +338,21 @@ get_restic_version() {
     else
         echo "nicht installiert"
     fi
+}
+
+# Convert restic duration string to seconds (e.g. "5m" -> 300, "1h" -> 3600)
+parse_duration() {
+    local d="$1"
+    local num unit
+    num=$(echo "$d" | grep -oE '[0-9]+' | head -1)
+    unit=$(echo "$d" | grep -oE '[smhd]' | head -1)
+    case "$unit" in
+        s) echo "$num" ;;
+        m) echo $((num * 60)) ;;
+        h) echo $((num * 3600)) ;;
+        d) echo $((num * 86400)) ;;
+        *) echo 300 ;;  # default 5 min
+    esac
 }
 
 # Loads --retry-lock and --cache-dir into RESTIC_EXTRA_OPTS array
@@ -426,10 +441,10 @@ auto_unlock_if_stale() {
     last_seen=$(jq -r '.lock_state.last_seen // ""' "$CONFIG_FILE" 2>/dev/null)
     last_unlock=$(jq -r '.lock_state.last_unlock_attempt // ""' "$CONFIG_FILE" 2>/dev/null)
 
-    # Kein vorheriger Lock erkannt → nichts zu tun
+    # Kein vorheriger Lock erkannt -> nichts zu tun
     [ -z "$last_seen" ] || [ "$last_seen" = "null" ] && return 0
 
-    # Bereits nach dem letzten Lock entsperrt → nichts zu tun
+    # Bereits nach dem letzten Lock entsperrt -> nichts zu tun
     if [ -n "$last_unlock" ] && [ "$last_unlock" != "null" ]; then
         local unlock_ts seen_ts
         unlock_ts=$(date -d "$last_unlock" +%s 2>/dev/null || echo 0)
@@ -463,6 +478,29 @@ auto_unlock_if_stale() {
 
     local host; host=$(get_hostname)
     notify_error 0 "Repo war ${age_hours}h gesperrt — Auto-Unlock durchgeführt" "" "unlock"
+}
+
+# Periodic unlock retry loop: keep trying unlock until repo is accessible or timeout
+pre_backup_unlock_retry() {
+    local repo_url="$1" repo_pw="$2"
+    shift 2
+    local repo_opts=("$@")
+    local timeout_str; timeout_str=$(jq -r '.retry_lock // "5m"' "$CONFIG_FILE" 2>/dev/null || echo "5m")
+    local timeout_secs; timeout_secs=$(parse_duration "$timeout_str")
+    local waited=0 interval=30
+
+    while [ "$waited" -lt "$timeout_secs" ]; do
+        if restic "${RESTIC_EXTRA_OPTS[@]}" "${repo_opts[@]}" \
+            -r "$repo_url" --password-file "$repo_pw" \
+            snapshots --last &>/dev/null; then
+            return 0
+        fi
+        restic "${RESTIC_EXTRA_OPTS[@]}" "${repo_opts[@]}" \
+            -r "$repo_url" --password-file "$repo_pw" unlock &>/dev/null || true
+        sleep "$interval"
+        waited=$((waited + interval))
+    done
+    return 1
 }
 
 # Track lock detection in JSON for stale lock detection
@@ -592,6 +630,15 @@ run_backup() {
 
     # Auto-Unlock falls Repo >24h gesperrt war
     auto_unlock_if_stale
+
+    # Silent pre-unlock: stale locks from crashed backups sofort entfernen
+    if load_repo_context "main"; then
+        restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" \
+            -r "$REPO_URL" --password-file "$REPO_PW_FILE" unlock &>/dev/null || true
+        # Periodic retry: wenn Repo durch laufendes Backup gesperrt ist, warten
+        pre_backup_unlock_retry "$REPO_URL" "$REPO_PW_FILE" "${REPO_OPTS[@]}" || true
+        cleanup_repo_context
+    fi
 
     # Kompressions-Einstellung
     local conf_compression; conf_compression=$(jq -r '.compression // "auto"' "$CONFIG_FILE")
@@ -805,6 +852,15 @@ run_action_all_repos() {
     migrate_env_to_json
 
     load_restic_extra_opts
+
+    # Silent pre-unlock for snapshot/init actions (not for explicit unlock action)
+    if [ "$action" != "unlock" ]; then
+        if load_repo_context "main"; then
+            restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" \
+                -r "$REPO_URL" --password-file "$REPO_PW_FILE" unlock &>/dev/null || true
+            cleanup_repo_context
+        fi
+    fi
 
     local r_host; r_host=$(jq -r '.host // ""' "$CONFIG_FILE")
     # snapshots_all = alle Computer anzeigen (kein --host Filter)
@@ -1207,13 +1263,13 @@ edit_repo_config() {
         local pwd_raw; pwd_raw=$(jq -r "${jq_path}.password      // \"\"" "$CONFIG_FILE")
         local ssh_raw; ssh_raw=$(jq -r "${jq_path}.env.SSHPASS   // \"\"" "$CONFIG_FILE")
         local v_pwd_str v_ssh_str v_ak_str v_sk_str v_kid_str v_bk_str v_bp_str
-        [ -n "$pwd_raw" ] && v_pwd_str="$(col_ok '✔ gesetzt')"   || v_pwd_str="$(col_err '✘ fehlt')"
-        [ -n "$ssh_raw" ] && v_ssh_str="$(col_ok '✔ gesetzt')"   || v_ssh_str="$(col_err '✘ fehlt')"
-        [ -n "$v_ak"    ] && v_ak_str="$(col_ok "$v_ak")"         || v_ak_str="$(col_err '✘ fehlt')"
-        [ -n "$v_sk"    ] && v_sk_str="$(col_ok '✔ gesetzt')"     || v_sk_str="$(col_err '✘ fehlt')"
-        [ -n "$v_kid"   ] && v_kid_str="$(col_ok "$v_kid")"       || v_kid_str="$(col_err '✘ fehlt')"
-        [ -n "$v_bk"    ] && v_bk_str="$(col_ok '✔ gesetzt')"     || v_bk_str="$(col_err '✘ fehlt')"
-        [ -n "$v_bpass" ] && v_bp_str="$(col_ok '✔ gesetzt')"     || v_bp_str="$(col_dim '– leer')"
+        [ -n "$pwd_raw" ] && v_pwd_str="$(col_ok 'gesetzt')"   || v_pwd_str="$(col_err 'fehlt')"
+        [ -n "$ssh_raw" ] && v_ssh_str="$(col_ok 'gesetzt')"   || v_ssh_str="$(col_err 'fehlt')"
+        [ -n "$v_ak"    ] && v_ak_str="$(col_ok "$v_ak")"         || v_ak_str="$(col_err 'fehlt')"
+        [ -n "$v_sk"    ] && v_sk_str="$(col_ok 'gesetzt')"     || v_sk_str="$(col_err 'fehlt')"
+        [ -n "$v_kid"   ] && v_kid_str="$(col_ok "$v_kid")"       || v_kid_str="$(col_err 'fehlt')"
+        [ -n "$v_bk"    ] && v_bk_str="$(col_ok 'gesetzt')"     || v_bk_str="$(col_err 'fehlt')"
+        [ -n "$v_bpass" ] && v_bp_str="$(col_ok 'gesetzt')"     || v_bp_str="$(col_dim '- leer')"
 
         # Header
         printf "${C_BOLD}╔══════════════════════════════════════════╗${C_RESET}\n"
@@ -1227,13 +1283,13 @@ edit_repo_config() {
         case "$r_type" in
             sftp)
                 printf "  ${C_BOLD}1)${C_RESET}  Benutzer         %s\n" \
-                    "$([ -n "$v_user" ] && col_ok "$v_user" || col_err "✘ fehlt")"
+                    "$([ -n "$v_user" ] && col_ok "$v_user" || col_err "fehlt")"
                 printf "  ${C_DIM}     SSH-Benutzername auf dem Backup-Server${C_RESET}\n"
                 printf "  ${C_BOLD}2)${C_RESET}  Host             %s\n" \
-                    "$([ -n "$v_host" ] && col_ok "$v_host" || col_err "✘ fehlt")"
+                    "$([ -n "$v_host" ] && col_ok "$v_host" || col_err "fehlt")"
                 printf "  ${C_DIM}     IP-Adresse oder Hostname des Servers${C_RESET}\n"
                 printf "  ${C_BOLD}3)${C_RESET}  Pfad             %s\n" \
-                    "$([ -n "$v_path" ] && col_ok "$v_path" || col_err "✘ fehlt")"
+                    "$([ -n "$v_path" ] && col_ok "$v_path" || col_err "fehlt")"
                 printf "  ${C_DIM}     Verzeichnispfad auf dem Server${C_RESET}\n"
                 printf "  ${C_BOLD}4)${C_RESET}  Restic-Passwort  %b\n" "$v_pwd_str"
                 printf "  ${C_DIM}     Verschlüsselt deine Backup-Daten${C_RESET}\n"
@@ -1242,13 +1298,13 @@ edit_repo_config() {
                 ;;
             s3)
                 printf "  ${C_BOLD}1)${C_RESET}  Endpoint         %s\n" \
-                    "$([ -n "$v_host" ] && col_ok "$v_host" || col_err "✘ fehlt")"
+                    "$([ -n "$v_host" ] && col_ok "$v_host" || col_err "fehlt")"
                 printf "  ${C_DIM}     z.B. s3.amazonaws.com oder minio.host:9000${C_RESET}\n"
                 printf "  ${C_BOLD}2)${C_RESET}  Bucket           %s\n" \
-                    "$([ -n "$v_bucket" ] && col_ok "$v_bucket" || col_err "✘ fehlt")"
+                    "$([ -n "$v_bucket" ] && col_ok "$v_bucket" || col_err "fehlt")"
                 printf "  ${C_DIM}     Name des S3-Buckets${C_RESET}\n"
                 printf "  ${C_BOLD}3)${C_RESET}  Pfad             %s\n" \
-                    "$([ -n "$v_path" ] && col_ok "$v_path" || col_dim "– leer (Root)")"
+                    "$([ -n "$v_path" ] && col_ok "$v_path" || col_dim "- leer (Root)")"
                 printf "  ${C_DIM}     Unterordner im Bucket, z.B. /server1${C_RESET}\n"
                 printf "  ${C_BOLD}4)${C_RESET}  Restic-Passwort  %b\n" "$v_pwd_str"
                 printf "  ${C_DIM}     Verschlüsselt deine Backup-Daten${C_RESET}\n"
@@ -1259,10 +1315,10 @@ edit_repo_config() {
                 ;;
             b2)
                 printf "  ${C_BOLD}1)${C_RESET}  Bucket           %s\n" \
-                    "$([ -n "$v_bucket" ] && col_ok "$v_bucket" || col_err "✘ fehlt")"
+                    "$([ -n "$v_bucket" ] && col_ok "$v_bucket" || col_err "fehlt")"
                 printf "  ${C_DIM}     Name des Backblaze B2 Buckets${C_RESET}\n"
                 printf "  ${C_BOLD}2)${C_RESET}  Pfad             %s\n" \
-                    "$([ -n "$v_path" ] && col_ok "$v_path" || col_dim "– leer (Root)")"
+                    "$([ -n "$v_path" ] && col_ok "$v_path" || col_dim "- leer (Root)")"
                 printf "  ${C_DIM}     Unterordner im Bucket, z.B. /server1${C_RESET}\n"
                 printf "  ${C_BOLD}3)${C_RESET}  Restic-Passwort  %b\n" "$v_pwd_str"
                 printf "  ${C_DIM}     Verschlüsselt deine Backup-Daten${C_RESET}\n"
@@ -1273,10 +1329,10 @@ edit_repo_config() {
                 ;;
             rest)
                 printf "  ${C_BOLD}1)${C_RESET}  Server-URL       %s\n" \
-                    "$([ -n "$v_url" ] && col_ok "$v_url" || col_err "✘ fehlt")"
+                    "$([ -n "$v_url" ] && col_ok "$v_url" || col_err "fehlt")"
                 printf "  ${C_DIM}     z.B. https://backup.example.com:8000/${C_RESET}\n"
                 printf "  ${C_BOLD}2)${C_RESET}  Basic-Auth Benutzer  %s\n" \
-                    "$([ -n "$v_username" ] && col_ok "$v_username" || col_dim "– leer (kein Auth)")"
+                    "$([ -n "$v_username" ] && col_ok "$v_username" || col_dim "- leer (kein Auth)")"
                 printf "  ${C_DIM}     HTTP Basic Auth Benutzername${C_RESET}\n"
                 printf "  ${C_BOLD}3)${C_RESET}  Basic-Auth Passwort  %b\n" "$v_bp_str"
                 printf "  ${C_DIM}     HTTP Basic Auth Passwort${C_RESET}\n"
@@ -1285,7 +1341,7 @@ edit_repo_config() {
                 ;;
             local)
                 printf "  ${C_BOLD}1)${C_RESET}  Pfad             %s\n" \
-                    "$([ -n "$v_path" ] && col_ok "$v_path" || col_err "✘ fehlt")"
+                    "$([ -n "$v_path" ] && col_ok "$v_path" || col_err "fehlt")"
                 printf "  ${C_DIM}     Vollständiger Pfad, z.B. /mnt/usb-backup${C_RESET}\n"
                 printf "  ${C_BOLD}2)${C_RESET}  Restic-Passwort  %b\n" "$v_pwd_str"
                 printf "  ${C_DIM}     Verschlüsselt deine Backup-Daten${C_RESET}\n"
@@ -1440,7 +1496,7 @@ ntfy_send_test() {
     local http_code
     http_code=$(curl -s -o /dev/null -w "%{http_code}" "${auth_args[@]}" \
         -H "Title: Backup Test: ${host}" \
-        -H "Tags: white_check_mark" \
+        -H "Tags: information" \
         -H "Priority: default" \
         -d "$msg" \
         "${ntfy_url}/${ntfy_topic}")
@@ -2051,8 +2107,8 @@ menu_ntfy_settings() {
         ntfy_user=$(jq -r    '.notifications.ntfy.username // ""' "$CONFIG_FILE")
 
         local en_str
-        [ "$ntfy_en" = "true" ] && en_str="$(col_ok '✔ Aktiv')" \
-                                 || en_str="$(col_warn '– Inaktiv')"
+        [ "$ntfy_en" = "true" ] && en_str="$(col_ok 'Aktiv')" \
+                                 || en_str="$(col_warn '- Inaktiv')"
 
         printf "${C_BOLD}╔══════════════════════════════════════════╗${C_RESET}\n"
         printf "${C_BOLD}║    NTFY PUSH-BENACHRICHTIGUNGEN          ║${C_RESET}\n"
@@ -2168,24 +2224,24 @@ menu_settings() {
         # ── Farbige Status-Strings ────────────────────────────────────────────
         local svc_str tmr_str ntfy_str comp_str
         if $svc_ok; then
-            svc_str="$(col_ok '✔ Installiert')"
+            svc_str="$(col_ok 'Installiert')"
         else
-            svc_str="$(col_err '✘ Nicht installiert')"
+            svc_str="$(col_err 'Nicht installiert')"
         fi
 
         if $timer_active; then
-            tmr_str="$(col_ok "✔ Aktiv") $(col_info "[$current_sched]")"
+            tmr_str="$(col_ok "Aktiv") $(col_info "[$current_sched]")"
         elif $svc_ok; then
-            tmr_str="$(col_warn '⏸ Pausiert')"
+            tmr_str="$(col_warn 'Pausiert')"
         else
-            tmr_str="$(col_err '✘ Nicht eingerichtet')"
+            tmr_str="$(col_err 'Nicht eingerichtet')"
         fi
 
         if [ "$ntfy_active" = "true" ]; then
-            ntfy_str="$(col_ok '✔ An')"
+            ntfy_str="$(col_ok 'An')"
             [ -n "$ntfy_topic" ] && ntfy_str+=" $(col_info "(Topic: $ntfy_topic)")"
         else
-            ntfy_str="$(col_warn '– Aus')"
+            ntfy_str="$(col_warn '- Aus')"
         fi
 
         case "$r_comp" in
@@ -2197,14 +2253,14 @@ menu_settings() {
 
         local main_str copy_str
         if [ "$main_type" = "?" ] || [ -z "$main_type" ]; then
-            main_str="$(col_err '✘ Nicht konfiguriert')"
+            main_str="$(col_err 'Nicht konfiguriert')"
         else
-            main_str="$(col_ok "✔ $main_type")"
-            [ -n "$main_host" ] && main_str+=" $(col_info "→ $main_host")"
+            main_str="$(col_ok "$main_type")"
+            [ -n "$main_host" ] && main_str+=" $(col_info "-> $main_host")"
         fi
 
         if [ "$copy_count" -eq 0 ]; then
-            copy_str="$(col_dim '– keine')"
+            copy_str="$(col_dim '- keine')"
         else
             copy_str="$(col_ok "$enabled_copies") von $(col_info "$copy_count") aktiv"
         fi
@@ -2332,7 +2388,7 @@ install_script() {
     sed -i 's|CONFIG_FILE="$(dirname "$SCRIPT_PATH")/.restic_backup.json"|CONFIG_FILE="/etc/restic_backup.json"|' "$target"
     sed -i 's|OLD_CONFIG_FILE="$(dirname "$SCRIPT_PATH")/.restic_backup.env"|OLD_CONFIG_FILE="/etc/restic_backup.env"|' "$target"
 
-    echo ">> ✔ Installation erfolgreich!"
+    echo ">> Installation erfolgreich!"
     echo ">> Du kannst das Backup-Tool ab sofort von überall mit dem Befehl 'restic-backup' starten."
     echo ">> Die Konfigurationsdatei wird fortan unter '/etc/restic_backup.json' gespeichert."
 
@@ -2345,7 +2401,7 @@ install_script() {
             echo ">> WARNUNG: '$alias_target' existiert bereits und wird nicht überschrieben."
         else
             ln -s "$target" "$alias_target"
-            echo ">> ✔ Alias '$alias_name' -> '$target' eingerichtet."
+            echo ">> Alias '$alias_name' -> '$target' eingerichtet."
             echo ">> Du kannst das Tool nun auch mit '$alias_name' starten."
         fi
     fi
@@ -2385,7 +2441,7 @@ NUTZUNG:  $S [FLAGS]    (Flags kombinierbar)
          Videos, JPEGs, ZIP-Archive, verschlüsselte Dateien
 
   -x   Großes Pack-Format   (kombinierbar)
-         --pack-size 128 → weniger, größere Pack-Dateien
+         --pack-size 128 -> weniger, größere Pack-Dateien
          Besser für HDDs / langsame Verbindungen
 
   -d   Dry-Run / Testlauf
@@ -2398,7 +2454,7 @@ NUTZUNG:  $S [FLAGS]    (Flags kombinierbar)
          Zeigt: ID, Datum, Größe, Pfade
 
   -L   Snapshots ALLER Computer
-         Kein Host-Filter → alle Hosts sichtbar
+         Kein Host-Filter -> alle Hosts sichtbar
          Nützlich bei mehreren Rechnern im gleichen Repo
 
 ── WARTUNG ────────────────────────────────────────────────
@@ -2448,7 +2504,7 @@ NUTZUNG:  $S [FLAGS]    (Flags kombinierbar)
   Vollgas     16            -15     alle        normal
   Sparmodus    2             19     1           Idle (3)
 
-  SFTP→SFTP-Kopie (Main + Copy beide SFTP):
+  SFTP->SFTP-Kopie (Main + Copy beide SFTP):
   • Main-Repo:  sshpass -e  (SSHPASS Umgebungsvariable)
   • Copy-Repo:  sshpass -f <tmpfile>  (kein Env-Konflikt)
   • Benötigt restic ≥ 0.14 für --from-option
@@ -2464,7 +2520,7 @@ NUTZUNG:  $S [FLAGS]    (Flags kombinierbar)
   Pfad:          $CFG
   Berechtigung:  600 (nur root lesbar, Passwörter sicher)
   Format:        JSON (jq-verarbeitet)
-  Bearbeiten:    sudo $S -s  → "Konfiguration bearbeiten"
+  Bearbeiten:    sudo $S -s  -> "Konfiguration bearbeiten"
 
 ── VORAUSSETZUNGEN ────────────────────────────────────────
   Pflicht:   restic ≥ 0.14, jq, curl
@@ -2486,7 +2542,7 @@ RUN_BACKUP=false
 SHOW_SETTINGS=false
 INIT_REPO=false
 
-# Kein Argument → Hilfe anzeigen
+# Kein Argument -> Hilfe anzeigen
 if [ $# -eq 0 ]; then
     show_help
 fi
