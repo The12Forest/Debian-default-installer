@@ -2,10 +2,14 @@
 export HOME="${HOME:-/root}"
 
 # =============================================================================
-# Restic Multi-Repo Backup Script v2.0
+# Restic Multi-Repo Backup Script
 # Vollständige TUI-Konfiguration, kein externer Editor benötigt
 # Erfordert: restic >= 0.14, jq, curl, sshpass (für SFTP)
 # =============================================================================
+
+# Einzige Stelle für die Versionsnummer -- wird überall (Titel, Hilfe, etc.)
+# von hier referenziert, damit sie nur an einem Ort gepflegt werden muss.
+SCRIPT_VERSION="3.0"
 
 SCRIPT_PATH="$(realpath "$0")"
 CONFIG_FILE="$(dirname "$SCRIPT_PATH")/.restic_backup.json"
@@ -15,11 +19,20 @@ SERVICE_NAME="restic-sftp-backup.service"
 TIMER_NAME="restic-sftp-backup.timer"
 SYSTEMD_DIR="/etc/systemd/system"
 
+# Hintergrund-Modus (tmux) -- laeuft wie ein Daemon weiter
+TMUX_SESSION="restic-backup"
+LOG_DIR="/var/log/restic-backup"
+
 FULL_RESOURCES=false
 ECONOMY_MODE=false
 EXTRA_RESOURCES=false
 DRY_RUN_FLAG=""
 NO_COMPRESSION=false
+
+# Eigener Mutex, damit sich zwei Läufe des Skripts (z.B. Cron + manuell)
+# niemals überlappen und dadurch scheinbar "stale" Repo-Locks erzeugen
+SCRIPT_LOCKFILE="/run/restic-backup-manual.lock"
+SCRIPT_LOCK_FD=200
 
 DEFAULT_EXCLUDES=(
     "/proc" "/sys" "/dev" "/run" "/tmp"
@@ -109,6 +122,22 @@ require_sshpass() {
         elif command -v pacman  &>/dev/null; then pacman -Sy --noconfirm sshpass
         elif command -v zypper  &>/dev/null; then zypper install -y sshpass
         else echo ">> Bitte sshpass manuell installieren."; return 1; fi
+    fi
+}
+
+require_tmux() {
+    if ! command -v tmux &>/dev/null; then
+        echo ">> 'tmux' wird fuer den Hintergrund-Modus benoetigt, ist aber nicht installiert."
+        if [ "$EUID" -ne 0 ]; then
+            echo ">> Bitte als root ausfuehren oder tmux manuell installieren."; return 1
+        fi
+        echo ">> Installiere tmux..."
+        if   command -v apt-get &>/dev/null; then apt-get update -qq && apt-get install -y tmux
+        elif command -v dnf     &>/dev/null; then dnf install -y tmux
+        elif command -v pacman  &>/dev/null; then pacman -Sy --noconfirm tmux
+        elif command -v zypper  &>/dev/null; then zypper install -y tmux
+        elif command -v apk     &>/dev/null; then apk add tmux
+        else echo ">> Unbekannter Paketmanager. Bitte tmux manuell installieren."; return 1; fi
     fi
 }
 
@@ -247,7 +276,9 @@ migrate_env_to_json() {
             host: $host,
             compression: "auto",
             retry_lock: "5m",
+            stale_unlock_hours: 2,
             cache_dir: "~/.cache/restic",
+            retention: { keep_daily: 31, keep_weekly: 4, keep_monthly: 6, keep_yearly: 0, keep_last: 0, prune: true },
             lock_state: { last_seen: "", last_unlock_attempt: "" },
             notifications: { ntfy: { enabled: false } },
             main: {
@@ -331,10 +362,10 @@ restic_supports_retry_lock() {
     [ "$major" -gt 0 ] || { [ "$major" -eq 0 ] && [ "$minor" -ge 16 ]; }
 }
 
-# Returns full restic version string (e.g. "restic 0.17.0") or "nicht installiert"
+# Returns kurze restic-Version (z.B. "0.17.0") oder "nicht installiert"
 get_restic_version() {
     if command -v restic &>/dev/null; then
-        restic version 2>/dev/null | head -1
+        restic version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
     else
         echo "nicht installiert"
     fi
@@ -372,6 +403,95 @@ load_restic_extra_opts() {
 }
 
 RESTIC_EXTRA_OPTS=()
+
+# ==========================================
+# Aufbewahrungsregeln (retention) aus Config lesen
+# Ergebnis in RETENTION_ARGS (Array, vom Aufrufer deklariert)
+# ==========================================
+build_retention_args() {
+    RETENTION_ARGS=()
+    local kd kw km ky kl
+    kd=$(jq -r '.retention.keep_daily   // 31' "$CONFIG_FILE" 2>/dev/null)
+    kw=$(jq -r '.retention.keep_weekly  // 4'  "$CONFIG_FILE" 2>/dev/null)
+    km=$(jq -r '.retention.keep_monthly // 6'  "$CONFIG_FILE" 2>/dev/null)
+    ky=$(jq -r '.retention.keep_yearly  // 0'  "$CONFIG_FILE" 2>/dev/null)
+    kl=$(jq -r '.retention.keep_last    // 0'  "$CONFIG_FILE" 2>/dev/null)
+    [[ "$kd" =~ ^[0-9]+$ ]] && [ "$kd" -gt 0 ] && RETENTION_ARGS+=(--keep-daily "$kd")
+    [[ "$kw" =~ ^[0-9]+$ ]] && [ "$kw" -gt 0 ] && RETENTION_ARGS+=(--keep-weekly "$kw")
+    [[ "$km" =~ ^[0-9]+$ ]] && [ "$km" -gt 0 ] && RETENTION_ARGS+=(--keep-monthly "$km")
+    [[ "$ky" =~ ^[0-9]+$ ]] && [ "$ky" -gt 0 ] && RETENTION_ARGS+=(--keep-yearly "$ky")
+    [[ "$kl" =~ ^[0-9]+$ ]] && [ "$kl" -gt 0 ] && RETENTION_ARGS+=(--keep-last "$kl")
+}
+
+# true wenn nach forget automatisch geprunt werden soll (Default: an)
+retention_prune_enabled() {
+    [ "$(jq_bool '.retention.prune' "$CONFIG_FILE" 2>/dev/null)" = "true" ]
+}
+
+# ==========================================
+# Skript-Mutex: verhindert ueberlappende Laeufe
+# (z.B. Cron + manueller Start), die sonst wie
+# ein "stale" Repo-Lock aussehen wuerden
+# ==========================================
+acquire_script_lock() {
+    eval "exec ${SCRIPT_LOCK_FD}>\"$SCRIPT_LOCKFILE\"" 2>/dev/null || return 0
+    if ! flock -n "$SCRIPT_LOCK_FD"; then
+        echo ">> FEHLER: Es läuft bereits ein Backup-Vorgang dieses Skripts."
+        echo ">> (Lockfile: $SCRIPT_LOCKFILE)"
+        echo ">> Das ist vermutlich die Ursache für den 'Repo gesperrt'-Fehler —"
+        echo ">> nicht ein alter/verwaister Lock, sondern ein wirklich laufendes Backup."
+        echo ">> Prüfe z.B.: tmux has-session -t $TMUX_SESSION ; ps aux | grep restic"
+        exit 1
+    fi
+    echo $$ >&"$SCRIPT_LOCK_FD"
+}
+
+release_script_lock() {
+    flock -u "$SCRIPT_LOCK_FD" 2>/dev/null || true
+    eval "exec ${SCRIPT_LOCK_FD}>&-" 2>/dev/null || true
+}
+
+# ==========================================
+# Force-Unlock: entfernt ALLE Locks (--remove-all),
+# auch solche die restic selbst nicht als "stale"
+# erkennen kann (z.B. weil sie von einem anderen
+# Host/Container gesetzt wurden). Nur manuell nutzen,
+# wenn sicher ist, dass kein Backup wirklich läuft!
+# ==========================================
+force_unlock_repo() {
+    echo "=========================================="
+    echo "   FORCE-UNLOCK (--remove-all)"
+    echo "=========================================="
+    echo "  ACHTUNG: Entfernt ALLE Locks im Repo, auch wenn restic"
+    echo "  sie nicht selbst als 'stale' erkennt. Nur ausführen,"
+    echo "  wenn du SICHER bist, dass kein Backup aktuell läuft!"
+    echo "------------------------------------------"
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        echo "  WARNUNG: Es läuft gerade ein Hintergrund-Backup (tmux: $TMUX_SESSION)!"
+        echo "  Bitte erst prüfen (sudo $0 -A), bevor du fortfährst."
+    fi
+    if [ -f "$SCRIPT_LOCKFILE" ] && ! flock -n -x "$SCRIPT_LOCKFILE" -c true 2>/dev/null; then
+        echo "  WARNUNG: Ein anderer Lauf dieses Skripts hält gerade den Mutex."
+    fi
+    read -rp "  Wirklich ALLE Locks entfernen? (ja/nein): " confirm
+    if [ "$confirm" != "ja" ]; then
+        echo "  Abgebrochen."
+        sleep 1; return
+    fi
+
+    if load_repo_context "main"; then
+        if restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" \
+            -r "$REPO_URL" --password-file "$REPO_PW_FILE" unlock --remove-all; then
+            echo ">> Alle Locks entfernt."
+        else
+            echo ">> FEHLER: Force-Unlock fehlgeschlagen."
+        fi
+        cleanup_repo_context
+    else
+        echo ">> FEHLER: Main-Repo nicht konfiguriert."
+    fi
+    read -rp "  Weiter mit Enter..."
+}
 
 # ==========================================
 # Restic-Ausfuehrung mit Fehlerbehandlung
@@ -434,7 +554,7 @@ cleanup_on_shutdown() {
 }
 
 # ==========================================
-# Auto-Unlock: Repo entsperren wenn >24h gesperrt
+# Auto-Unlock: Repo entsperren wenn zu lange gesperrt
 # ==========================================
 auto_unlock_if_stale() {
     local last_seen last_unlock
@@ -452,20 +572,32 @@ auto_unlock_if_stale() {
         [ "$unlock_ts" -gt "$seen_ts" ] && return 0
     fi
 
-    # Prüfe ob der Lock älter als 24h ist
+    # Schwelle konfigurierbar (Standard 2h statt 24h — bei REST-Server-Repos
+    # erkennt "restic unlock" ohne --remove-all einen Lock oft nicht als
+    # stale, z.B. wenn er nicht vom aktuellen Host stammt; 24h Wartezeit
+    # blockiert dann unnötig lange tägliche Backups)
+    local stale_hours; stale_hours=$(jq -r '.stale_unlock_hours // 2' "$CONFIG_FILE" 2>/dev/null)
+    [[ "$stale_hours" =~ ^[0-9]+$ ]] || stale_hours=2
+
     local now_ts seen_ts
     now_ts=$(date +%s)
     seen_ts=$(date -d "$last_seen" +%s 2>/dev/null || echo 0)
     local age_hours=$(( (now_ts - seen_ts) / 3600 ))
-    [ "$age_hours" -lt 24 ] && return 0
+    [ "$age_hours" -lt "$stale_hours" ] && return 0
 
-    echo ">> Repo seit ${age_hours}h gesperrt (>24h). Versuche Auto-Unlock..."
+    echo ">> Repo seit ${age_hours}h gesperrt (>${stale_hours}h). Versuche Auto-Unlock..."
 
-    # Unlock main repo
+    # Erst normaler (sicherer) Unlock, dann --remove-all als harter Fallback:
+    # nach $stale_hours Stunden ist ein noch echter, laufender Backup-Lauf
+    # praktisch ausgeschlossen (der Skript-Mutex verhindert Überlappungen
+    # ohnehin), daher ist --remove-all hier vertretbar.
     if load_repo_context "main"; then
         if restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" \
             -r "$REPO_URL" --password-file "$REPO_PW_FILE" unlock 2>/dev/null; then
             echo ">> Main-Repo erfolgreich entsperrt (Auto-Unlock nach ${age_hours}h)."
+        elif restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" \
+            -r "$REPO_URL" --password-file "$REPO_PW_FILE" unlock --remove-all 2>/dev/null; then
+            echo ">> Main-Repo mit --remove-all entsperrt (normaler Unlock hat Lock nicht als stale erkannt)."
         else
             echo ">> WARNUNG: Auto-Unlock des Main-Repos fehlgeschlagen."
         fi
@@ -622,13 +754,19 @@ run_backup() {
         exit 1
     fi
 
-    # Trap setzen: bei Shutdown/SIGTERM Repos entsperren
-    trap cleanup_on_shutdown SIGTERM SIGINT SIGHUP
+    # Eigener Mutex zuerst: verhindert, dass zwei gleichzeitige Läufe
+    # (Cron + manuell, Doppelstart etc.) einen echten Lock-Konflikt
+    # erzeugen, der dann fälschlich wie ein "stale" Repo-Lock aussieht
+    acquire_script_lock
+    trap 'release_script_lock' EXIT
+
+    # Trap setzen: bei Shutdown/SIGTERM Repos entsperren (zusätzlich zum EXIT-Trap)
+    trap 'cleanup_on_shutdown; release_script_lock' SIGTERM SIGINT SIGHUP
 
     # Extra-Opts laden (--retry-lock, --cache-dir)
     load_restic_extra_opts
 
-    # Auto-Unlock falls Repo >24h gesperrt war
+    # Auto-Unlock falls Repo zu lange gesperrt war
     auto_unlock_if_stale
 
     # Silent pre-unlock: stale locks from crashed backups sofort entfernen
@@ -673,6 +811,11 @@ run_backup() {
     local r_host; r_host=$(jq -r '.host // ""' "$CONFIG_FILE")
     local RESTIC_HOST_OPT=()
     [ -n "$r_host" ] && [ "$r_host" != "null" ] && RESTIC_HOST_OPT=("--host" "$r_host")
+
+    local RETENTION_ARGS=()
+    build_retention_args
+    local PRUNE_ARGS=()
+    retention_prune_enabled && PRUNE_ARGS=(--prune)
 
     # ------------------------------------------------------------------
     # SCHRITT 1: Backup ins Main-Repository
@@ -720,7 +863,7 @@ run_backup() {
         --password-file "$REPO_PW_FILE" \
         forget \
         "${RESTIC_HOST_OPT[@]}" \
-        --keep-daily 31 --keep-weekly 4 --keep-monthly 6 --prune \
+        "${RETENTION_ARGS[@]}" "${PRUNE_ARGS[@]}" \
         "${DRY_RUN_ARGS[@]}"
 
     cleanup_repo_context
@@ -818,7 +961,7 @@ run_backup() {
                 --password-file "$REPO_PW_FILE" \
                 forget \
                 "${RESTIC_HOST_OPT[@]}" \
-                --keep-daily 31 --keep-weekly 4 --keep-monthly 6 --prune \
+                "${RETENTION_ARGS[@]}" "${PRUNE_ARGS[@]}" \
                 "${DRY_RUN_ARGS[@]}"
 
             rm -f "$copy_ssh_tmp" 2>/dev/null || true
@@ -839,7 +982,12 @@ run_backup() {
 
     echo ""
     echo ">> Backup-Vorgang abgeschlossen."
-    [[ -t 0 ]] && read -rp "Drücke Enter..."
+    # WICHTIG: run_backup läuft jetzt ausschließlich als Hintergrund-Worker
+    # innerhalb von tmux (via -Z). "-t 0" ist dort IMMER wahr, auch wenn
+    # niemand angehängt ist (tmux stellt jedem Pane ein eigenes pty bereit) --
+    # ein "Drücke Enter" würde also für immer auf einen Tastendruck warten,
+    # den niemand geben kann, und die tmux-Session nie beenden.
+    ! $INTERNAL_WORKER && [[ -t 0 ]] && read -rp "Drücke Enter..."
 }
 
 # ==========================================
@@ -920,6 +1068,101 @@ run_action_all_repos() {
         fi
     done
 
+    echo ">> Fertig."
+    [[ -t 0 ]] && read -rp "Drücke Enter..."
+}
+
+# ==========================================
+# Manuelles Repo-Cleanup (forget + prune)
+# Nutzt dieselben Aufbewahrungsregeln wie der automatische
+# Lauf nach jedem Backup, kann aber jederzeit von Hand mit
+# Vorschau (--dry-run) ausgeführt werden.
+# ==========================================
+_cleanup_repo_loop() {
+    local mode="$1" dry="$2"   # mode: forget | prune
+
+    local DRY=()
+    [ "$dry" = "true" ] && DRY=(--dry-run)
+
+    local RETENTION_ARGS=()
+    build_retention_args
+    local PRUNE_ARGS=()
+    { [ "$mode" = "forget" ] && [ "$dry" != "true" ] && retention_prune_enabled; } && PRUNE_ARGS=(--prune)
+
+    local r_host; r_host=$(jq -r '.host // ""' "$CONFIG_FILE")
+    local RESTIC_HOST_OPT=()
+    [ -n "$r_host" ] && [ "$r_host" != "null" ] && RESTIC_HOST_OPT=("--host" "$r_host")
+
+    _cleanup_one_repo() {
+        local label="$1"
+        echo ">> [$label]"
+        if [ "$mode" = "forget" ]; then
+            restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" \
+                forget "${RESTIC_HOST_OPT[@]}" "${RETENTION_ARGS[@]}" "${PRUNE_ARGS[@]}" "${DRY[@]}"
+        else
+            restic "${RESTIC_EXTRA_OPTS[@]}" "${REPO_OPTS[@]}" -r "$REPO_URL" --password-file "$REPO_PW_FILE" prune
+        fi
+    }
+
+    if load_repo_context "main"; then
+        _cleanup_one_repo "MAIN REPO"
+        cleanup_repo_context
+    else
+        echo ">> WARNUNG: Main-Repo nicht konfiguriert."
+    fi
+
+    local copy_count; copy_count=$(jq '.copies | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    for i in $(seq 0 $((copy_count - 1))); do
+        local c_enabled c_name
+        c_enabled=$(jq_bool ".copies[$i].enabled" "$CONFIG_FILE")
+        c_name=$(jq -r ".copies[$i].name // \"Copy #$((i+1))\"" "$CONFIG_FILE")
+        [ "$c_enabled" != "true" ] && continue
+        if load_repo_context "$i"; then
+            _cleanup_one_repo "$c_name"
+            cleanup_repo_context
+        fi
+    done
+}
+
+run_manual_cleanup() {
+    require_jq
+    migrate_env_to_json
+    load_restic_extra_opts
+
+    local RETENTION_ARGS=()
+    build_retention_args
+    local retention_str="${RETENTION_ARGS[*]:-<keine Limits gesetzt>}"
+    local prune_str="aus"; retention_prune_enabled && prune_str="an"
+
+    clear
+    echo "=========================================="
+    echo "   REPO CLEANUP (forget + prune)"
+    echo "=========================================="
+    echo "  Aufbewahrung: $retention_str"
+    echo "  Prune nach Forget: $prune_str"
+    echo "  (Einstellbar unter: Konfiguration bearbeiten -> Globale Einstellungen)"
+    echo "------------------------------------------"
+    echo "  1) Vorschau (--dry-run, es wird NICHTS gelöscht)"
+    echo "  2) Jetzt wirklich ausführen (Main + aktive Copies)"
+    echo "  3) Nur Prune (Speicher freigeben, keine Snapshots löschen)"
+    echo "  4) Lokalen Cache aufräumen (restic cache --cleanup)"
+    echo "  0) Zurück"
+    echo "=========================================="
+    read -rp "  Auswahl: " cchoice
+
+    case "$cchoice" in
+        1) echo ""; _cleanup_repo_loop "forget" "true" ;;
+        2) if tui_confirm "Wirklich Snapshots gemäß Aufbewahrungsregeln löschen?" "n"; then
+               echo ""; _cleanup_repo_loop "forget" "false"
+           fi ;;
+        3) if tui_confirm "Prune auf allen aktiven Repos ausführen?" "j"; then
+               echo ""; _cleanup_repo_loop "prune" "false"
+           fi ;;
+        4) echo ""; restic "${RESTIC_EXTRA_OPTS[@]}" cache --cleanup ;;
+        0) return ;;
+    esac
+
+    echo ""
     echo ">> Fertig."
     [[ -t 0 ]] && read -rp "Drücke Enter..."
 }
@@ -1647,6 +1890,29 @@ edit_global_settings() {
         echo "  4) Cache-Verzeichnis:     $r_cache"
         echo "     Pfad zum restic-Cache (~/.cache/restic = Default)"
         echo "------------------------------------------"
+        local r_stale; r_stale=$(jq -r '.stale_unlock_hours // 2' "$CONFIG_FILE")
+        echo " 11) Auto-Unlock nach:     ${r_stale}h"
+        echo "     Ab wann ein noch bestehender Lock zwangsweise entfernt wird"
+        echo "     (nur relevant wenn 'restic unlock' ihn nicht selbst als stale erkennt,"
+        echo "      z.B. bei REST-Server-Repos mit Zugriff von mehreren Hosts)"
+        echo " 12) Repo jetzt sofort entsperren (--remove-all)"
+        echo "     Manueller Notfall-Unlock — nur wenn sicher kein Backup läuft!"
+        echo "------------------------------------------"
+        local r_kd r_kw r_km r_ky r_kl r_prune
+        r_kd=$(jq -r '.retention.keep_daily   // 31' "$CONFIG_FILE")
+        r_kw=$(jq -r '.retention.keep_weekly  // 4'  "$CONFIG_FILE")
+        r_km=$(jq -r '.retention.keep_monthly // 6'  "$CONFIG_FILE")
+        r_ky=$(jq -r '.retention.keep_yearly  // 0'  "$CONFIG_FILE")
+        r_kl=$(jq -r '.retention.keep_last    // 0'  "$CONFIG_FILE")
+        r_prune=$(jq_bool '.retention.prune' "$CONFIG_FILE")
+        echo "  Aufbewahrung / Cleanup (forget nach jedem Backup):"
+        echo " 13) Täglich behalten:      $r_kd"
+        echo " 14) Wöchentlich behalten:  $r_kw"
+        echo " 15) Monatlich behalten:    $r_km"
+        echo " 16) Jährlich behalten:     $r_ky      (0 = deaktiviert)"
+        echo " 17) Letzte N behalten:     $r_kl      (0 = deaktiviert, zusätzlich zu obigem)"
+        echo " 18) Prune nach Forget:     $r_prune"
+        echo "------------------------------------------"
         echo "  Ntfy Push-Benachrichtigungen: [$ntfy_status_str]"
         echo "  5) Aktiviert:          $ntfy_en"
         echo "  6) Server URL:         $ntfy_url"
@@ -1691,6 +1957,31 @@ edit_global_settings() {
             10) if [ "$ntfy_en" = "true" ]; then
                    ntfy_send_test
                fi ;;
+            11) tui_input "Auto-Unlock nach (Stunden)" "$r_stale" \
+                    "Ganze Zahl, z.B. 2. Kleiner = aggressiver, größer = vorsichtiger."
+                if [[ "$TUI_RESULT" =~ ^[0-9]+$ ]]; then
+                    config_set_arg '.stale_unlock_hours = ($val | tonumber)' "$TUI_RESULT"
+                else
+                    echo "  >> Ungültig, muss eine Zahl sein."; sleep 1
+                fi ;;
+            12) force_unlock_repo ;;
+            13) tui_input "Täglich behalten (keep-daily)" "$r_kd" "Ganze Zahl, 0 = deaktiviert"
+                [[ "$TUI_RESULT" =~ ^[0-9]+$ ]] && config_set_arg '.retention.keep_daily = ($val | tonumber)' "$TUI_RESULT" ;;
+            14) tui_input "Wöchentlich behalten (keep-weekly)" "$r_kw" "Ganze Zahl, 0 = deaktiviert"
+                [[ "$TUI_RESULT" =~ ^[0-9]+$ ]] && config_set_arg '.retention.keep_weekly = ($val | tonumber)' "$TUI_RESULT" ;;
+            15) tui_input "Monatlich behalten (keep-monthly)" "$r_km" "Ganze Zahl, 0 = deaktiviert"
+                [[ "$TUI_RESULT" =~ ^[0-9]+$ ]] && config_set_arg '.retention.keep_monthly = ($val | tonumber)' "$TUI_RESULT" ;;
+            16) tui_input "Jährlich behalten (keep-yearly)" "$r_ky" "Ganze Zahl, 0 = deaktiviert"
+                [[ "$TUI_RESULT" =~ ^[0-9]+$ ]] && config_set_arg '.retention.keep_yearly = ($val | tonumber)' "$TUI_RESULT" ;;
+            17) tui_input "Letzte N behalten (keep-last)" "$r_kl" "Ganze Zahl, 0 = deaktiviert"
+                [[ "$TUI_RESULT" =~ ^[0-9]+$ ]] && config_set_arg '.retention.keep_last = ($val | tonumber)' "$TUI_RESULT" ;;
+            18) if [ "$r_prune" = "true" ]; then
+                    config_set '.retention.prune = false'
+                    echo "  >> Prune nach Forget deaktiviert (Speicher wird nicht automatisch freigegeben)."
+                else
+                    config_set '.retention.prune = true'
+                    echo "  >> Prune nach Forget aktiviert."
+                fi; sleep 1 ;;
             0) return ;;
         esac
     done
@@ -1950,25 +2241,143 @@ update_restic() {
 }
 
 # ==========================================
-# Service-Logs anzeigen
+# Hintergrund-Modus (tmux) -- laeuft wie ein Daemon weiter
 # ==========================================
-view_service_logs() {
-    clear
-    echo "=========================================="
-    echo "   SERVICE LOGS (letzte 50 Zeilen)"
-    echo "=========================================="
-    if [ -f "$SYSTEMD_DIR/$SERVICE_NAME" ]; then
-        journalctl --no-pager -u "$SERVICE_NAME" -n 50 2>/dev/null || echo "  (keine Logs verfuegbar)"
-    else
-        echo "  Service nicht installiert."
+build_mode_args() {
+    # -Z ist ein interner Marker: signalisiert der Skript-Instanz, die
+    # tmux tatsaechlich ausfuehrt, dass sie der "Worker" ist und den
+    # Backup direkt starten soll (nicht erneut im Hintergrund landen --
+    # sonst Endlos-Rekursion, da JEDER Backup-Start jetzt automatisch
+    # im Hintergrund laeuft).
+    MODE_ARGS=("-r" "-Z")
+    $FULL_RESOURCES   && MODE_ARGS+=("-f")
+    $ECONOMY_MODE     && MODE_ARGS+=("-e")
+    $EXTRA_RESOURCES  && MODE_ARGS+=("-x")
+    $NO_COMPRESSION   && MODE_ARGS+=("-n")
+    [ -n "$DRY_RUN_FLAG" ] && MODE_ARGS+=("-d")
+}
+
+start_daemon_run() {
+    local mode_label="$1"; shift
+    local mode_args=("$@")
+
+    require_tmux || { echo ">> tmux nicht verfuegbar, breche ab."; return 1; }
+
+    if [ "$EUID" -ne 0 ]; then
+        echo ">> FEHLER: Hintergrund-Modus benoetigt Root-Rechte (fuer Log-Verzeichnis & Backup)."
+        return 1
     fi
+
+    # Mutex zusaetzlich zur tmux-Session pruefen: verhindert Race zwischen
+    # Cron-Trigger und manuellem Start
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        echo ">> Es läuft bereits ein Backup im Hintergrund (Session: $TMUX_SESSION)."
+        echo ">> Verbinden mit: sudo $0 -A"
+        return 1
+    fi
+
+    mkdir -p "$LOG_DIR"
+    chmod 700 "$LOG_DIR"
+    local ts; ts=$(date +%Y%m%d-%H%M%S)
+    local logfile="$LOG_DIR/backup-${ts}.log"
+    touch "$logfile"
+    ln -sf "$logfile" "$LOG_DIR/latest.log"
+
+    echo ">> Starte Backup im Hintergrund: $mode_label (Log: $logfile)"
+
+    # tmux fuehrt den eigentlichen Backup-Lauf direkt aus (kein interaktives
+    # bash danach) -- die Session endet von selbst, sobald restic fertig ist.
+    # Das ist die gemeinsame Grundlage fuer manuelle UND Cron-Laeufe: egal
+    # woher der Start kam, das Reconnect (-A) findet dieselbe Session/Logdatei.
+    # Jede Zeile bekommt einen Zeitstempel vorangestellt (read -r Schleife,
+    # || [ -n "$line" ] fängt eine letzte Zeile ohne Zeilenumbruch mit ab).
+    local cmd
+    cmd="'$SCRIPT_PATH' ${mode_args[*]} 2>&1 | "
+    cmd+='while IFS= read -r line || [ -n "$line" ]; do '
+    cmd+='printf "[%s] %s\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$line"; '
+    cmd+="done > '$logfile'"
+    tmux new-session -d -s "$TMUX_SESSION" "$cmd"
+
+    # Ohne Terminal (z.B. Cron/systemd) keine UI oeffnen -- nur starten und fertig
+    if [ ! -t 1 ]; then
+        echo ">> Nicht-interaktiv gestartet, Backup laeuft im Hintergrund weiter."
+        return 0
+    fi
+
+    view_background_job "$logfile"
+}
+
+# ==========================================
+# Live-Ansicht des Hintergrund-Jobs: normales Terminal,
+# einfach "tail -f" auf die Log-Datei. Ein Observer im
+# Hintergrund beendet die Anzeige automatisch, sobald der
+# tmux-Worker fertig ist. Strg+C beendet NUR die Anzeige
+# (tail) -- das Skript selbst läuft weiter (zurück ins Menü),
+# das Backup im Hintergrund ist davon nicht betroffen.
+# ==========================================
+view_background_job() {
+    local logfile="$1"
+    clear
+    echo ">> Live-Log: $logfile"
+    echo ">> (Strg+C beendet nur die Anzeige — das Backup läuft im Hintergrund weiter)"
     echo "------------------------------------------"
-    echo "  F) Logs live verfolgen (Ctrl+C zum Beenden)"
-    echo "  0) Zurueck"
-    read -rp "  Auswahl: " logchoice
-    if [[ "$logchoice" =~ ^[Ff]$ ]]; then
-        echo ">> Live-Log (Ctrl+C beenden)..."
-        journalctl -f -u "$SERVICE_NAME" 2>/dev/null
+
+    # tail laeuft als eigener Hintergrund-Prozess (nicht als Vordergrund-
+    # Kommando des Skripts) -- so bekommt NUR tail ein SIGINT vom Terminal,
+    # nicht das ganze Skript. "wait" darauf ist per SIGINT unterbrechbar,
+    # der Trap darunter faengt genau dieses SIGINT ab, killt tail explizit
+    # und kehrt sauber aus der Funktion zurueck (kein Haengenbleiben).
+    tail -n 50 -f "$logfile" &
+    local tail_pid=$!
+
+    # Observer: pollt ob die tmux-Session noch lebt und beendet die
+    # tail-Anzeige automatisch, sobald der Backup-Lauf fertig ist.
+    (
+        while tmux has-session -t "$TMUX_SESSION" 2>/dev/null; do
+            sleep 1
+        done
+        kill "$tail_pid" 2>/dev/null
+    ) &
+    local observer_pid=$!
+
+    local interrupted=false
+    trap 'interrupted=true; kill "$tail_pid" 2>/dev/null' SIGINT
+    wait "$tail_pid" 2>/dev/null
+    trap - SIGINT
+
+    kill "$observer_pid" 2>/dev/null || true
+    wait "$observer_pid" 2>/dev/null || true
+
+    echo ""
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        echo ">> Log-Ansicht getrennt. Backup läuft im Hintergrund weiter."
+        echo ">> Wieder verbinden: sudo $0 -A"
+    else
+        echo ">> Backup-Vorgang beendet."
+    fi
+}
+
+attach_daemon() {
+    require_tmux || { echo ">> tmux nicht verfuegbar."; return 1; }
+
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        echo ">> Verbinde mit laufendem Backup..."
+        local logfile; logfile=$(readlink -f "$LOG_DIR/latest.log" 2>/dev/null)
+        if [ -n "$logfile" ] && [ -f "$logfile" ]; then
+            view_background_job "$logfile"
+        else
+            # Fallback falls kein Logfile ermittelbar: klassisches tmux attach
+            tmux attach -t "$TMUX_SESSION"
+        fi
+    else
+        echo ">> Kein Backup läuft aktuell im Hintergrund."
+        if [ -f "$LOG_DIR/latest.log" ]; then
+            echo ">> Letztes Log (letzte 80 Zeilen):"
+            echo "------------------------------------------"
+            tail -n 80 "$LOG_DIR/latest.log"
+        else
+            echo ">> Es wurde noch kein Hintergrund-Backup ausgeführt."
+        fi
     fi
 }
 
@@ -1978,7 +2387,7 @@ view_service_logs() {
 install_systemd_automatic() {
     cat > "$SYSTEMD_DIR/$SERVICE_NAME" << EOF
 [Unit]
-Description=Restic Backup Service
+Description=Restic Backup Service (startet Hintergrund-Job via tmux)
 After=network-online.target
 Wants=network-online.target
 
@@ -1988,6 +2397,11 @@ ExecStart=$SCRIPT_PATH -f
 StandardOutput=journal
 StandardError=journal
 Environment="HOME=/root"
+# WICHTIG: der eigentliche Backup-Prozess laeuft in einer eigenstaendigen
+# tmux-Session weiter, auch nachdem dieser oneshot-Unit "fertig" ist.
+# KillMode=none verhindert, dass systemd beim Beenden dieses Units die
+# tmux-Session (die im selben Cgroup haengt) mit-killt.
+KillMode=none
 EOF
 
     cat > "$SYSTEMD_DIR/$TIMER_NAME" << EOF
@@ -2006,7 +2420,9 @@ EOF
     systemctl daemon-reload
     systemctl enable --now "$TIMER_NAME"
     echo ">> Auto-Backup Service installiert."
-    echo ">> Laeuft täglich um 02:00 Uhr (+ bis 5 Min. Zufallsverzögerung)."
+    echo ">> Läuft täglich um 02:00 Uhr (+ bis 5 Min. Zufallsverzögerung)."
+    echo ">> Läuft, egal ob per Cron oder manuell gestartet, immer über dieselbe"
+    echo ">> Hintergrund-Session — Logs/Reconnect jederzeit mit: sudo $0 -A"
     sleep 2
 }
 
@@ -2041,33 +2457,37 @@ update_timer_settings() {
 # Backup-Modus-Auswahlmenue
 # ==========================================
 menu_run_vorgang() {
-    while true; do
-        clear
-        echo "=========================================="
-        echo "          BACKUP VORGANG STARTEN          "
-        echo "=========================================="
-        echo "  1) Standard       Nice 10 | auto-Komp. | SFTP x8"
-        echo "  2) Vollgas (-f)   Alle CPUs | Prio -15 | SFTP x16"
-        echo "  3) Sparmodus (-e) 1 CPU | Idle I/O | SFTP x2"
-        echo "  4) Dry-Run        Testlauf, KEINE echten Änderungen"
-        echo "  5) Vollgas o.K.   Wie Vollgas, keine Komprimierung"
-        echo "  0) Zurück"
-        echo "=========================================="
-        read -rp "  Auswahl: " vchoice
+    clear
+    echo "=========================================="
+    echo "          BACKUP VORGANG STARTEN          "
+    echo "  (läuft immer im Hintergrund via tmux —"
+    echo "   überlebt Verbindungsabbruch)"
+    echo "=========================================="
+    echo "  1) Standard       Nice 10 | auto-Komp. | SFTP x8"
+    echo "  2) Vollgas (-f)   Alle CPUs | Prio -15 | SFTP x16"
+    echo "  3) Sparmodus (-e) 1 CPU | Idle I/O | SFTP x2"
+    echo "  4) Dry-Run        Testlauf, KEINE echten Änderungen"
+    echo "  5) Vollgas o.K.   Wie Vollgas, keine Komprimierung"
+    echo "  0) Zurück"
+    echo "=========================================="
+    read -rp "  Auswahl: " vchoice
 
-        FULL_RESOURCES=false; ECONOMY_MODE=false
-        DRY_RUN_FLAG=""; NO_COMPRESSION=false
+    FULL_RESOURCES=false; ECONOMY_MODE=false
+    DRY_RUN_FLAG=""; NO_COMPRESSION=false
 
-        case $vchoice in
-            1) run_backup "Standard"                                   ; break ;;
-            2) FULL_RESOURCES=true; run_backup "Vollgas"               ; break ;;
-            3) ECONOMY_MODE=true;   run_backup "Sparmodus"             ; break ;;
-            4) DRY_RUN_FLAG="--dry-run"; run_backup "Dry-Run"          ; break ;;
-            5) FULL_RESOURCES=true; NO_COMPRESSION=true
-               run_backup "Vollgas ohne Komprimierung"                 ; break ;;
-            0) return ;;
-        esac
-    done
+    case $vchoice in
+        1) : ;;
+        2) FULL_RESOURCES=true ;;
+        3) ECONOMY_MODE=true ;;
+        4) DRY_RUN_FLAG="--dry-run" ;;
+        5) FULL_RESOURCES=true; NO_COMPRESSION=true ;;
+        0) return ;;
+        *) return ;;
+    esac
+
+    build_mode_args
+    start_daemon_run "Hintergrund-Backup" "${MODE_ARGS[@]}"
+    [[ -t 0 ]] && read -rp "Drücke Enter..."
 }
 
 # ==========================================
@@ -2086,7 +2506,9 @@ menu_ntfy_settings() {
                 host: "",
                 compression: "auto",
                 retry_lock: "5m",
+                stale_unlock_hours: 2,
                 cache_dir: "~/.cache/restic",
+                retention: { keep_daily: 31, keep_weekly: 4, keep_monthly: 6, keep_yearly: 0, keep_last: 0, prune: true },
                 lock_state: { last_seen: "", last_unlock_attempt: "" },
                 notifications: { ntfy: { enabled: false } },
                 main: {},
@@ -2222,12 +2644,7 @@ menu_settings() {
         done
 
         # ── Farbige Status-Strings ────────────────────────────────────────────
-        local svc_str tmr_str ntfy_str comp_str
-        if $svc_ok; then
-            svc_str="$(col_ok 'Installiert')"
-        else
-            svc_str="$(col_err 'Nicht installiert')"
-        fi
+        local tmr_str ntfy_str comp_str
 
         if $timer_active; then
             tmr_str="$(col_ok "Aktiv") $(col_info "[$current_sched]")"
@@ -2267,51 +2684,57 @@ menu_settings() {
 
         # ── Header ───────────────────────────────────────────────────────────
         printf "${C_BOLD}╔══════════════════════════════════════════╗${C_RESET}\n"
-        printf "${C_BOLD}║    RESTIC BACKUP MANAGER  v2.0           ║${C_RESET}\n"
+        printf "${C_BOLD}║    RESTIC BACKUP MANAGER  v%-4s          ║${C_RESET}\n" "$SCRIPT_VERSION"
         printf "${C_BOLD}╚══════════════════════════════════════════╝${C_RESET}\n"
 
         # ── Status-Panel ─────────────────────────────────────────────────────
         printf "  ${C_BOLD}%-14s${C_RESET} %s\n"  "Host:"        "$(col_info "$r_host")"
 
-        local restic_ver_str restic_lock_ok
+        local restic_ver_str restic_lock_warn=""
         restic_ver_str=$(get_restic_version)
-        if restic_supports_retry_lock; then
-            restic_lock_ok="$(col_ok '(retry-lock ok)')"
-        else
-            restic_lock_ok="$(col_warn '(retry-lock fehlt)')"
-        fi
-        printf "  ${C_BOLD}%-14s${C_RESET} %s %s\n" "Restic:" "$(col_info "$restic_ver_str")" "$restic_lock_ok"
+        restic_supports_retry_lock || restic_lock_warn=" $(col_warn '(Update empfohlen)')"
+        printf "  ${C_BOLD}%-14s${C_RESET} %s%s\n" "Restic:" "$(col_info "$restic_ver_str")" "$restic_lock_warn"
 
         printf "  ${C_BOLD}%-14s${C_RESET} %s\n"  "Kompression:" "$comp_str"
         printf "  ${C_BOLD}%-14s${C_RESET} %s\n"  "Main-Repo:"   "$main_str"
         printf "  ${C_BOLD}%-14s${C_RESET} %s\n"  "Copy-Repos:"  "$copy_str"
         printf "  ${C_BOLD}%-14s${C_RESET} %b\n"  "Ntfy:"        "$ntfy_str"
-        printf "  ${C_BOLD}%-14s${C_RESET} %b\n"  "Service:"     "$svc_str"
-        printf "  ${C_BOLD}%-14s${C_RESET} %b\n"  "Timer:"       "$tmr_str"
+        printf "  ${C_BOLD}%-14s${C_RESET} %b\n"  "Auto-Backup:" "$tmr_str"
 
         printf "${C_DIM}──────────────────────────────────────────${C_RESET}\n"
 
         # ── Menü ─────────────────────────────────────────────────────────────
         printf "  ${C_BOLD}${C_GREEN}B)${C_RESET}  Backup-Vorgang starten\n"
+        if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+            printf "  ${C_BOLD}${C_GREEN}A)${C_RESET}  Mit laufendem Backup verbinden / Logs\n"
+        fi
         printf "${C_DIM}  ── Snapshots & Wartung ───────────────────${C_RESET}\n"
-        printf "  ${C_BOLD}1)${C_RESET}  Snapshots dieses Computers anzeigen\n"
-        printf "  ${C_BOLD}2)${C_RESET}  Snapshots ${C_BOLD}ALLER${C_RESET} Computer anzeigen\n"
-        printf "  ${C_BOLD}3)${C_RESET}  Repositories entsperren  ${C_DIM}(nur aktive)${C_RESET}\n"
-        printf "  ${C_BOLD}4)${C_RESET}  Repository-Init prüfen   ${C_DIM}(nur aktive)${C_RESET}\n"
-        printf "  ${C_BOLD}R)${C_RESET}  Restic updaten            ${C_DIM}(alle Distros)${C_RESET}\n"
+        printf "  ${C_BOLD}1)${C_RESET}  Snapshots dieses Computers\n"
+        printf "  ${C_BOLD}2)${C_RESET}  Snapshots ${C_BOLD}ALLER${C_RESET} Computer\n"
+        printf "  ${C_BOLD}3)${C_RESET}  Repositories entsperren\n"
+        printf "  ${C_BOLD}F)${C_RESET}  Repository Force-Unlock\n"
+        printf "  ${C_BOLD}4)${C_RESET}  Repository-Init prüfen\n"
+        printf "  ${C_BOLD}C)${C_RESET}  Cleanup / Prune\n"
+        printf "  ${C_BOLD}R)${C_RESET}  Restic updaten\n"
         printf "${C_DIM}  ── Konfiguration ─────────────────────────${C_RESET}\n"
         printf "  ${C_BOLD}5)${C_RESET}  Konfiguration bearbeiten\n"
         printf "  ${C_BOLD}6)${C_RESET}  Ersteinrichtung neu starten\n"
-        printf "  ${C_BOLD}7)${C_RESET}  Copy-Repos verwalten  ${C_DIM}(EIN/AUS/Löschen)${C_RESET}\n"
+        printf "  ${C_BOLD}7)${C_RESET}  Copy-Repos verwalten\n"
         printf "  ${C_BOLD}8)${C_RESET}  Neues Copy-Repository hinzufügen\n"
         printf "  ${C_BOLD}E)${C_RESET}  Ordner-Ausschlüsse bearbeiten\n"
-        printf "  ${C_BOLD}N)${C_RESET}  Ntfy-Benachrichtigungen konfigurieren\n"
-        printf "${C_DIM}  ── Auto-Backup (systemd) ─────────────────${C_RESET}\n"
-        printf "  ${C_BOLD}9)${C_RESET}  Auto-Backup Service installieren\n"
-        printf " ${C_BOLD}10)${C_RESET}  Timer-Zeitplan anpassen\n"
-        printf " ${C_BOLD}11)${C_RESET}  Auto-Backup ein-/ausschalten\n"
-        printf " ${C_BOLD}12)${C_RESET}  Service komplett entfernen\n"
-        printf " ${C_BOLD}13)${C_RESET}  Service-Logs anzeigen\n"
+        printf "  ${C_BOLD}N)${C_RESET}  Ntfy-Benachrichtigungen\n"
+        printf "${C_DIM}  ── Auto-Backup ───────────────────────────${C_RESET}\n"
+        if $svc_ok; then
+            printf "  ${C_BOLD}9)${C_RESET}  Zeitplan anpassen\n"
+            if $timer_active; then
+                printf " ${C_BOLD}10)${C_RESET}  Pausieren\n"
+            else
+                printf " ${C_BOLD}10)${C_RESET}  Aktivieren\n"
+            fi
+            printf " ${C_BOLD}11)${C_RESET}  Entfernen\n"
+        else
+            printf "  ${C_BOLD}9)${C_RESET}  Einrichten\n"
+        fi
         printf "${C_DIM}──────────────────────────────────────────${C_RESET}\n"
         printf "  ${C_BOLD}0)${C_RESET}  Beenden\n"
         printf "${C_DIM}──────────────────────────────────────────${C_RESET}\n"
@@ -2319,10 +2742,13 @@ menu_settings() {
 
         case $schoice in
             [Bb]) menu_run_vorgang ;;
+            [Aa]) attach_daemon ;;
             1)    run_action_all_repos "snapshots" ;;
             2)    run_action_all_repos "snapshots_all" ;;
             3)    run_action_all_repos "unlock" ;;
+            [Ff]) force_unlock_repo ;;
             4)    run_action_all_repos "init" ;;
+            [Cc]) run_manual_cleanup ;;
             [Rr]) update_restic ;;
             5)    menu_edit_configs ;;
             6)    do_setup_wizard ;;
@@ -2330,26 +2756,27 @@ menu_settings() {
             8)    add_copy_repo_wizard ;;
             [Ee]) menu_exclude_settings ;;
             [Nn]) menu_ntfy_settings ;;
-            9)    install_systemd_automatic ;;
-            10)   update_timer_settings ;;
+            9)
+                if $svc_ok; then update_timer_settings; else install_systemd_automatic; fi ;;
+            10)
+                if $svc_ok; then
+                    if $timer_active; then
+                        systemctl disable --now "$TIMER_NAME"
+                        printf "${C_YELLOW}>> Auto-Backup pausiert.${C_RESET}\n"
+                    else
+                        systemctl enable --now "$TIMER_NAME"
+                        printf "${C_GREEN}>> Auto-Backup gestartet.${C_RESET}\n"
+                    fi
+                    sleep 1
+                fi ;;
             11)
-                if $timer_active; then
-                    systemctl disable --now "$TIMER_NAME"
-                    printf "${C_YELLOW}>> Auto-Backup pausiert.${C_RESET}\n"
-                else
-                    systemctl enable --now "$TIMER_NAME"
-                    printf "${C_GREEN}>> Auto-Backup gestartet.${C_RESET}\n"
-                fi
-                sleep 1 ;;
-            12)
-                if tui_confirm "Service wirklich komplett entfernen?" "n"; then
+                if $svc_ok && tui_confirm "Service wirklich komplett entfernen?" "n"; then
                     systemctl disable --now "$TIMER_NAME" 2>/dev/null || true
                     rm -f "$SYSTEMD_DIR/$SERVICE_NAME" "$SYSTEMD_DIR/$TIMER_NAME"
                     systemctl daemon-reload
                     printf "${C_GREEN}>> Service entfernt.${C_RESET}\n"
                     sleep 1
                 fi ;;
-            13) view_service_logs ;;
             0) exit 0 ;;
         esac
     done
@@ -2417,7 +2844,7 @@ show_help() {
     cat << HELPEOF
 
 ══════════════════════════════════════════════════════════
-  Restic Multi-Repo Backup Manager  v2.0
+  Restic Multi-Repo Backup Manager  v$SCRIPT_VERSION
   Verschlüsseltes System-Backup — mehrere Backup-Ziele
 ══════════════════════════════════════════════════════════
 
@@ -2448,55 +2875,59 @@ NUTZUNG:  $S [FLAGS]    (Flags kombinierbar)
          Zeigt was passieren würde — ändert absolut nichts
          Kein Datentransfer, keine Snapshot-Erstellung
 
+── HINTERGRUND ─────────────────────────────────────────────
+  Jeder Backup-Start (-r/-f/-e/-n/-x/-d) läuft automatisch im
+  Hintergrund (tmux-Session) — überlebt Logout & Verbindungs-
+  abbruch, egal ob manuell oder vom Auto-Backup-Timer gestartet.
+  Benötigt root und tmux (wird bei Bedarf installiert)
+  (-b bleibt aus Kompatibilitätsgründen als Flag gültig, ist aber
+   ohne Wirkung — Hintergrund ist jetzt immer an)
+
+  -A   Mit laufendem Backup verbinden / Logs ansehen
+         Funktioniert unabhängig davon, ob der Lauf von dir
+         manuell oder vom Auto-Backup-Timer gestartet wurde.
+         Zeigt die Live-Logs im normalen Terminal (tail -f);
+         Strg+C beendet nur die Anzeige, das Backup läuft weiter.
+         Ohne laufenden Job wird stattdessen das letzte Log gezeigt.
+
 ── SNAPSHOT-ANZEIGE ───────────────────────────────────────
   -l   Snapshots dieses Computers
-         Filtert nach dem konfigurierten Hostnamen
-         Zeigt: ID, Datum, Größe, Pfade
-
   -L   Snapshots ALLER Computer
-         Kein Host-Filter -> alle Hosts sichtbar
-         Nützlich bei mehreren Rechnern im gleichen Repo
 
 ── WARTUNG ────────────────────────────────────────────────
   -u   Repositories entsperren
          Entfernt Sperrdateien nach Absturz / Kill
-         Betrifft alle aktiven Repos (Main + aktive Copies)
+
+  -U   Repository Force-Unlock (--remove-all)
+         Entfernt ALLE Locks, auch solche die restic selbst
+         nicht als "stale" erkennt (z.B. bei REST-Server-Repos
+         mit Zugriff von mehreren Hosts). Nur nutzen, wenn
+         sicher kein Backup gerade läuft!
 
   -I   Repository initialisieren / prüfen
-         Erstellt Repo-Struktur falls nicht vorhanden
-         Betrifft alle aktiven Repos
-         Sicher: bei bestehendem Repo passiert nichts
+
+  -C   Cleanup / Prune (TUI-Menü: Vorschau, Ausführen, Nur-Prune,
+         lokalen restic-Cache aufräumen)
+         Nutzt die in den Einstellungen konfigurierten
+         Aufbewahrungsregeln (keep-daily/-weekly/-monthly/...)
 
 ── SYSTEM ─────────────────────────────────────────────────
   -i   Skript systemweit installieren
          Kopiert das Skript nach /usr/local/bin/restic-backup
-         Verschiebt den Config-Pfad nach /etc/restic_backup.json
 
   -s   TUI-Einstellungsmenü  (benötigt sudo)
-         Vollständiges Menü für alle Einstellungen:
-         • Backup starten (alle Modi)
-         • Snapshots anzeigen (dieser Host / alle Hosts)
-         • Repos entsperren & initialisieren
-         • Konfiguration bearbeiten (alle Felder per TUI)
-         • Copy-Repos verwalten (EIN/AUS/Löschen)
-         • Ntfy-Benachrichtigungen konfigurieren & testen
-         • systemd Auto-Backup Timer einrichten
 
   -h   Diese Hilfe anzeigen
 
 ── KOMBINATIONSBEISPIELE ──────────────────────────────────
-  $S -r            Normales tägliches Backup
-  $S -f            Backup mit maximaler Geschwindigkeit
+  $S -r            Normales tägliches Backup (läuft im Hintergrund)
   $S -f -n         Vollgas, Daten bereits komprimiert
-  $S -e            Backup kaum spürbar im Hintergrund
   $S -e -d         Sparmodus-Testlauf ohne Änderungen
-  $S -f -x         Vollgas + große Pack-Dateien (HDD)
-  $S -r -n         Standard ohne Komprimierung
   $S -l            Snapshots dieses Hosts anzeigen
-  $S -L            Alle Snapshots aller Hosts anzeigen
   $S -u            Nach Absturz: Repos entsperren
-  $S -i            Repo-Struktur prüfen / anlegen
+  $S -U            Notfall: Repo zwangsweise entsperren
   sudo $S -s       TUI-Menü für Einrichtung & Verwaltung
+  sudo $S -A       Mit laufendem Backup verbinden (Cron oder manuell)
 
 ── SFTP-VERBINDUNGEN ──────────────────────────────────────
   Modus       Verbindungen   Nice   CPU-Kerne   I/O-Klasse
@@ -2509,12 +2940,14 @@ NUTZUNG:  $S [FLAGS]    (Flags kombinierbar)
   • Copy-Repo:  sshpass -f <tmpfile>  (kein Env-Konflikt)
   • Benötigt restic ≥ 0.14 für --from-option
 
-── AUFBEWAHRUNGSREGELN (automatisch) ──────────────────────
+── AUFBEWAHRUNGSREGELN (nach jedem Backup automatisch) ────
+  Standardwerte (einstellbar in den TUI-Einstellungen):
   --keep-daily   31   letzter Monat: täglich
   --keep-weekly   4   letzte 4 Wochen: wöchentlich
   --keep-monthly  6   letzte 6 Monate: monatlich
-  Ältere Snapshots werden automatisch gelöscht (--prune)
+  Ältere Snapshots werden gelöscht, danach optional --prune
   Gilt für Main-Repo und alle aktiven Copy-Repos
+  Manuell mit Vorschau ausführen: $S -C  (oder TUI: C)
 
 ── KONFIGURATIONSDATEI ────────────────────────────────────
   Pfad:          $CFG
@@ -2541,14 +2974,16 @@ HELPEOF
 RUN_BACKUP=false
 SHOW_SETTINGS=false
 INIT_REPO=false
+INTERNAL_WORKER=false
 
 # Kein Argument -> Hilfe anzeigen
 if [ $# -eq 0 ]; then
     show_help
 fi
 
-# getopts string anpassen: 'i' für Install, 'I' für Init
-while getopts "hsfexrdnuIiLl" opt; do
+# getopts string anpassen: 'i' für Install, 'I' für Init, 'b' für Hintergrund (Default, siehe unten),
+# 'A' für Attach, 'U' für Force-Unlock, 'C' für Cleanup, 'Z' interner Worker-Marker (nicht dokumentiert)
+while getopts "hsfexrdnuIiLlbAUCZ" opt; do
     case $opt in
         h) show_help ;;
         s) SHOW_SETTINGS=true; RUN_BACKUP=false ;;
@@ -2560,9 +2995,14 @@ while getopts "hsfexrdnuIiLl" opt; do
         x) EXTRA_RESOURCES=true; RUN_BACKUP=true ;;
         d) DRY_RUN_FLAG="--dry-run"; RUN_BACKUP=true ;;
         n) NO_COMPRESSION=true ;;
+        b) : ;;  # -b ist jetzt Default-Verhalten, Flag bleibt aus Kompatibilitätsgründen gültig
+        A) attach_daemon; exit 0 ;;
         u) run_action_all_repos "unlock";        exit 0 ;;
+        U) require_jq; migrate_env_to_json; force_unlock_repo; exit 0 ;;
+        C) run_manual_cleanup; exit 0 ;;
         l) run_action_all_repos "snapshots";     exit 0 ;;
         L) run_action_all_repos "snapshots_all"; exit 0 ;;
+        Z) INTERNAL_WORKER=true ;;  # intern: von start_daemon_run innerhalb tmux gesetzt
         *) show_help ;;
     esac
 done
@@ -2575,6 +3015,14 @@ fi
 if $SHOW_SETTINGS; then
     menu_settings
     exit 0
+fi
+
+# Jeder Backup-Start läuft jetzt immer im Hintergrund (tmux) -- außer es
+# ist bereits der interne Worker-Aufruf, der innerhalb der tmux-Session läuft.
+if $RUN_BACKUP && ! $INTERNAL_WORKER; then
+    build_mode_args
+    start_daemon_run "CLI-Hintergrund-Modus" "${MODE_ARGS[@]}"
+    exit $?
 fi
 
 if $RUN_BACKUP; then
