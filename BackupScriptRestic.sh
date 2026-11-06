@@ -12,8 +12,8 @@ export HOME="${HOME:-/root}"
 SCRIPT_VERSION="4.0"
 
 SCRIPT_PATH="$(realpath "$0")"
-CONFIG_FILE="$(dirname "$SCRIPT_PATH")/.restic_backup.json"
-OLD_CONFIG_FILE="$(dirname "$SCRIPT_PATH")/.restic_backup.env"
+CONFIG_FILE="/etc/restic_backup.json"
+OLD_CONFIG_FILE="/etc/restic_backup.env"
 
 SYSTEMD_DIR="/etc/systemd/system"
 SERVICE_NAME="restic-sftp-backup.service"
@@ -281,6 +281,7 @@ migrate_env_to_json() {
             unlock_retry_lock: "10m",
             stale_unlock_hours: 2,
             cache_dir: "~/.cache/restic",
+            purge_cache_after_backup: false,
             retention: { keep_daily: 31, keep_weekly: 4, keep_monthly: 6, keep_yearly: 0, keep_last: 0, prune: true },
             lock_state: { last_seen: "", last_unlock_attempt: "" },
             notifications: { ntfy: { enabled: false } },
@@ -417,6 +418,56 @@ RESTIC_EXTRA_OPTS=()
 RESTIC_UNLOCK_OPTS=()
 
 # ==========================================
+# Cache handling
+# ==========================================
+# Resolve the restic cache directory the same way restic does: the config
+# value (with ~ expansion), or restic's default if none is configured.
+restic_cache_dir() {
+    local d
+    d=$(jq -r '.cache_dir // "~/.cache/restic"' "$CONFIG_FILE" 2>/dev/null)
+    if [ -z "$d" ] || [ "$d" = "null" ]; then
+        if [ -n "$XDG_CACHE_HOME" ]; then
+            d="${XDG_CACHE_HOME}/restic"
+        else
+            d="~/.cache/restic"
+        fi
+    fi
+    d="${d/#\~/$HOME}"
+    printf '%s' "$d"
+}
+
+# Unlike jq_bool(), a missing/null setting counts as false here -- deleting
+# the cache must never be enabled implicitly on existing configurations.
+purge_cache_enabled() {
+    local raw
+    raw=$(jq -r '.purge_cache_after_backup' "$CONFIG_FILE" 2>/dev/null)
+    [ "$raw" = "true" ]
+}
+
+# Remove the restic cache directory. Only acts when the setting is enabled.
+purge_restic_cache() {
+    purge_cache_enabled || return 0
+
+    local cache_dir
+    cache_dir=$(restic_cache_dir)
+
+    # Safety net: never delete something that is obviously not a cache dir.
+    case "$cache_dir" in
+        ""|"/"|"."|"$HOME"|"$HOME/")
+            echo ">> WARNING: refusing to purge unsafe cache path '${cache_dir}'."
+            return 1
+            ;;
+    esac
+
+    echo ">> Purging restic cache: $cache_dir"
+    if rm -rf -- "$cache_dir"; then
+        echo ">> Restic cache removed."
+    else
+        echo ">> WARNING: could not remove restic cache at $cache_dir."
+    fi
+}
+
+# ==========================================
 # Read retention rules from config
 # Result goes into RETENTION_ARGS (array, declared by caller)
 # ==========================================
@@ -506,8 +557,11 @@ force_unlock_repo() {
 run_restic() {
     local label="$1"; shift
     local tmp_log; tmp_log=$(mktemp)
-    if ! "$@" 2> >(tee "$tmp_log" >&2); then
-        local rc=$?
+    # Capture the real exit status: inside `if ! cmd`, $? would be 0 (the
+    # status of the negated test), which broke error notifications.
+    local rc=0
+    "$@" 2> >(tee "$tmp_log" >&2) || rc=$?
+    if [ "$rc" -ne 0 ]; then
         local stderr; stderr=$(cat "$tmp_log" 2>/dev/null)
 
         # Detect error category from stderr patterns
@@ -760,6 +814,10 @@ run_backup() {
     require_jq
     migrate_env_to_json
 
+    # Track whether every restic step succeeded; the optional cache purge at
+    # the end only runs after a clean run (so a failed run can retry faster).
+    local backup_ok=true
+
     if [ ! -f "$CONFIG_FILE" ]; then
         echo ">> ERROR: no configuration found."
         echo ">> Please run setup: sudo $0 -s"
@@ -866,7 +924,7 @@ run_backup() {
         "${RESTIC_HOST_OPT[@]}" \
         "${RESTIC_EXCLUDE_ARGS[@]}" \
         "${RESTIC_SPEED_OPTS[@]}" \
-        "${DRY_RUN_ARGS[@]}"
+        "${DRY_RUN_ARGS[@]}" || backup_ok=false
 
     run_restic "forget main" $NICE_PREFIX restic \
         "${RESTIC_EXTRA_OPTS[@]}" \
@@ -876,7 +934,7 @@ run_backup() {
         forget \
         "${RESTIC_HOST_OPT[@]}" \
         "${RETENTION_ARGS[@]}" "${PRUNE_ARGS[@]}" \
-        "${DRY_RUN_ARGS[@]}"
+        "${DRY_RUN_ARGS[@]}" || backup_ok=false
 
     cleanup_repo_context
 
@@ -965,7 +1023,7 @@ run_backup() {
                 -r "$REPO_URL" \
                 --password-file "$REPO_PW_FILE" \
                 "${COPY_FROM_OPTS[@]}" \
-                copy --from-repo "$MAIN_URL" --from-password-file "$MAIN_PW_FILE"
+                copy --from-repo "$MAIN_URL" --from-password-file "$MAIN_PW_FILE" || backup_ok=false
 
             run_restic "forget $c_name" $NICE_PREFIX restic \
                 "${REPO_OPTS[@]}" \
@@ -974,7 +1032,7 @@ run_backup() {
                 forget \
                 "${RESTIC_HOST_OPT[@]}" \
                 "${RETENTION_ARGS[@]}" "${PRUNE_ARGS[@]}" \
-                "${DRY_RUN_ARGS[@]}"
+                "${DRY_RUN_ARGS[@]}" || backup_ok=false
 
             rm -f "$copy_ssh_tmp" 2>/dev/null || true
             cleanup_repo_context
@@ -994,6 +1052,18 @@ run_backup() {
 
     echo ""
     echo ">> Backup finished."
+
+    # Optional: purge the restic cache after a clean run
+    if [ -n "$DRY_RUN_FLAG" ]; then
+        if purge_cache_enabled; then
+            echo ">> Dry run: skipping cache purge."
+        fi
+    elif $backup_ok; then
+        purge_restic_cache
+    else
+        echo ">> Backup did not finish cleanly: skipping cache purge."
+    fi
+
     # IMPORTANT: when running as the background worker (INTERNAL_WORKER),
     # skip the "press enter" prompt: a tmux pane always provides a pty even
     # when nobody is attached, so [[ -t 0 ]] would still be true and this
@@ -1372,6 +1442,17 @@ do_setup_wizard() {
     tui_input "Cache directory" "$cur_cache" "Leave empty for restic's default (~/.cache/restic)"
     local r_cache="$TUI_RESULT"
 
+    # Purge cache after each backup
+    echo ""
+    echo "   Purge the restic cache after every successful backup:"
+    echo "   Saves disk space, but the next run has to download the index again."
+    local cur_purge="false"; [ -f "$CONFIG_FILE" ] && purge_cache_enabled && cur_purge="true"
+    local purge_default="n"; [ "$cur_purge" = "true" ] && purge_default="y"
+    local r_purge="false"
+    if tui_confirm "Purge the restic cache after each backup?" "$purge_default"; then
+        r_purge="true"
+    fi
+
     # Main repo
     echo ""
     echo "--- Main repository ---"
@@ -1427,10 +1508,12 @@ do_setup_wizard() {
       --arg retry "$r_retry" \
       --arg uretry "$r_unlock_retry" \
       --arg cache "$r_cache" \
+      --argjson purge "$r_purge" \
       --argjson main   "$main_json" \
       --argjson ntfy   "$njson" \
       --argjson copies "$existing_copies" \
       '{host:$h, compression:$comp, retry_lock:$retry, unlock_retry_lock:$uretry, cache_dir:$cache,
+        purge_cache_after_backup:$purge,
         lock_state:{last_seen:"", last_unlock_attempt:""},
         notifications:{ntfy:$ntfy}, main:$main, copies:$copies}' \
       > "$CONFIG_FILE"
@@ -1906,22 +1989,26 @@ edit_global_settings() {
         local r_retry r_cache
         r_retry=$(jq -r '.retry_lock // "5m"' "$CONFIG_FILE")
         r_cache=$(jq -r '.cache_dir // "~/.cache/restic"' "$CONFIG_FILE")
+        local r_purgecache="false"; purge_cache_enabled && r_purgecache="true"
         echo "  3) Retry-lock wait time (backup/forget/copy):  $r_retry"
         echo "     Wait time when the repo is locked (30s, 5m, 1h)"
         echo ""
         local r_uretry; r_uretry=$(jq -r '.unlock_retry_lock // "10m"' "$CONFIG_FILE")
-        echo " 19) Retry-lock wait time ONLY for unlock calls:  $r_uretry"
+        echo "  4) Retry-lock wait time ONLY for unlock calls:  $r_uretry"
         echo "     Keep this short! Prevents unlocking itself from hanging for hours."
         echo ""
-        echo "  4) Cache directory:     $r_cache"
+        echo "  5) Cache directory:     $r_cache"
         echo "     Path to the restic cache (~/.cache/restic = default)"
+        echo "  6) Purge cache after backup:  $r_purgecache"
+        echo "     Remove the restic cache directory at the end of every successful backup"
+        echo "     (next run is slower: the index has to be downloaded again)"
         echo "------------------------------------------"
         local r_stale; r_stale=$(jq -r '.stale_unlock_hours // 2' "$CONFIG_FILE")
-        echo " 11) Auto-unlock after:     ${r_stale}h"
+        echo "  7) Auto-unlock after:     ${r_stale}h"
         echo "     When a still-existing lock gets forcibly removed"
         echo "     (only relevant if 'restic unlock' doesn't recognize it as stale itself,"
         echo "      e.g. for REST-server repos accessed from multiple hosts)"
-        echo " 12) Unlock the repo right now (--remove-all)"
+        echo "  8) Unlock the repo right now (--remove-all)"
         echo "     Manual emergency unlock -- only when you're sure no backup is running!"
         echo "------------------------------------------"
         local r_kd r_kw r_km r_ky r_kl r_prune
@@ -1932,21 +2019,21 @@ edit_global_settings() {
         r_kl=$(jq -r '.retention.keep_last    // 0'  "$CONFIG_FILE")
         r_prune=$(jq_bool '.retention.prune' "$CONFIG_FILE")
         echo "  Retention / cleanup (forget after every backup):"
-        echo " 13) Keep daily:             $r_kd"
-        echo " 14) Keep weekly:            $r_kw"
-        echo " 15) Keep monthly:           $r_km"
-        echo " 16) Keep yearly:            $r_ky      (0 = disabled)"
-        echo " 17) Keep last N:            $r_kl      (0 = disabled, in addition to the above)"
-        echo " 18) Prune after forget:     $r_prune"
+        echo "  9) Keep daily:             $r_kd"
+        echo " 10) Keep weekly:            $r_kw"
+        echo " 11) Keep monthly:           $r_km"
+        echo " 12) Keep yearly:            $r_ky      (0 = disabled)"
+        echo " 13) Keep last N:            $r_kl      (0 = disabled, in addition to the above)"
+        echo " 14) Prune after forget:     $r_prune"
         echo "------------------------------------------"
         echo "  Ntfy push notifications: [$ntfy_status_str]"
-        echo "  5) Enabled:            $ntfy_en"
-        echo "  6) Server URL:         $ntfy_url"
-        echo "  7) Topic:              $ntfy_topic"
-        echo "  8) User:               ${ntfy_user:-<none>}"
-        echo "  9) Change password:    ****"
+        echo " 15) Enabled:            $ntfy_en"
+        echo " 16) Server URL:         $ntfy_url"
+        echo " 17) Topic:              $ntfy_topic"
+        echo " 18) User:               ${ntfy_user:-<none>}"
+        echo " 19) Change password:    ****"
         if [ "$ntfy_en" = "true" ]; then
-            echo " 10) Send test message"
+            echo " 20) Send test message"
         fi
         echo "------------------------------------------"
         echo "  0) Back"
@@ -1962,55 +2049,62 @@ edit_global_settings() {
                config_set_arg '.compression = $val' "$TUI_RESULT" ;;
             3) tui_input "Retry-lock wait time" "$r_retry" "Format: 30s, 5m, 1h (restic duration) - for backup/forget/copy"
                config_set_arg '.retry_lock = $val' "$TUI_RESULT" ;;
-            4) echo "   Default: ~/.cache/restic (resolved via HOME)"
+            5) echo "   Default: ~/.cache/restic (resolved via HOME)"
                tui_input "Cache directory" "$r_cache" "Leave empty for restic's default"
                config_set_arg '.cache_dir = $val' "$TUI_RESULT" ;;
-            5) if [ "$ntfy_en" = "true" ]; then
+            15) if [ "$ntfy_en" = "true" ]; then
                    config_set '.notifications.ntfy.enabled = false'
                    echo "  >> Ntfy disabled."
                else
                    config_set '.notifications.ntfy.enabled = true'
                    echo "  >> Ntfy enabled."
                fi; sleep 1 ;;
-            6) tui_input "Ntfy URL" "$ntfy_url" "URL of the ntfy server"
+            16) tui_input "Ntfy URL" "$ntfy_url" "URL of the ntfy server"
                config_set_arg '.notifications.ntfy.url = $val' "$TUI_RESULT" ;;
-            7) tui_input "Ntfy topic" "$ntfy_topic" "Topic name (you subscribe to this in the ntfy app)"
+            17) tui_input "Ntfy topic" "$ntfy_topic" "Topic name (you subscribe to this in the ntfy app)"
                config_set_arg '.notifications.ntfy.topic = $val' "$TUI_RESULT" ;;
-            8) tui_input "Ntfy user" "$ntfy_user" "Leave empty if no auth is needed"
+            18) tui_input "Ntfy user" "$ntfy_user" "Leave empty if no auth is needed"
                config_set_arg '.notifications.ntfy.username = $val' "$TUI_RESULT" ;;
-            9) tui_input "Ntfy password" "" "Password for ntfy login" "true"
+            19) tui_input "Ntfy password" "" "Password for ntfy login" "true"
                [ -n "$TUI_RESULT" ] && config_set_arg '.notifications.ntfy.password = $val' "$TUI_RESULT" ;;
-            10) if [ "$ntfy_en" = "true" ]; then
+            20) if [ "$ntfy_en" = "true" ]; then
                    ntfy_send_test
                fi ;;
-            11) tui_input "Auto-unlock after (hours)" "$r_stale" \
+            7) tui_input "Auto-unlock after (hours)" "$r_stale" \
                     "Whole number, e.g. 2. Smaller = more aggressive, larger = more cautious."
                 if [[ "$TUI_RESULT" =~ ^[0-9]+$ ]]; then
                     config_set_arg '.stale_unlock_hours = ($val | tonumber)' "$TUI_RESULT"
                 else
                     echo "  >> Invalid, must be a number."; sleep 1
                 fi ;;
-            12) force_unlock_repo ;;
-            13) tui_input "Keep daily (keep-daily)" "$r_kd" "Whole number, 0 = disabled"
+            8) force_unlock_repo ;;
+            9) tui_input "Keep daily (keep-daily)" "$r_kd" "Whole number, 0 = disabled"
                 [[ "$TUI_RESULT" =~ ^[0-9]+$ ]] && config_set_arg '.retention.keep_daily = ($val | tonumber)' "$TUI_RESULT" ;;
-            14) tui_input "Keep weekly (keep-weekly)" "$r_kw" "Whole number, 0 = disabled"
+            10) tui_input "Keep weekly (keep-weekly)" "$r_kw" "Whole number, 0 = disabled"
                 [[ "$TUI_RESULT" =~ ^[0-9]+$ ]] && config_set_arg '.retention.keep_weekly = ($val | tonumber)' "$TUI_RESULT" ;;
-            15) tui_input "Keep monthly (keep-monthly)" "$r_km" "Whole number, 0 = disabled"
+            11) tui_input "Keep monthly (keep-monthly)" "$r_km" "Whole number, 0 = disabled"
                 [[ "$TUI_RESULT" =~ ^[0-9]+$ ]] && config_set_arg '.retention.keep_monthly = ($val | tonumber)' "$TUI_RESULT" ;;
-            16) tui_input "Keep yearly (keep-yearly)" "$r_ky" "Whole number, 0 = disabled"
+            12) tui_input "Keep yearly (keep-yearly)" "$r_ky" "Whole number, 0 = disabled"
                 [[ "$TUI_RESULT" =~ ^[0-9]+$ ]] && config_set_arg '.retention.keep_yearly = ($val | tonumber)' "$TUI_RESULT" ;;
-            17) tui_input "Keep last N (keep-last)" "$r_kl" "Whole number, 0 = disabled"
+            13) tui_input "Keep last N (keep-last)" "$r_kl" "Whole number, 0 = disabled"
                 [[ "$TUI_RESULT" =~ ^[0-9]+$ ]] && config_set_arg '.retention.keep_last = ($val | tonumber)' "$TUI_RESULT" ;;
-            18) if [ "$r_prune" = "true" ]; then
+            14) if [ "$r_prune" = "true" ]; then
                     config_set '.retention.prune = false'
                     echo "  >> Prune after forget disabled (space won't be reclaimed automatically)."
                 else
                     config_set '.retention.prune = true'
                     echo "  >> Prune after forget enabled."
                 fi; sleep 1 ;;
-            19) tui_input "Unlock-retry-lock wait time" "$r_uretry" \
+            4) tui_input "Unlock-retry-lock wait time" "$r_uretry" \
                     "Format: 30s, 5m, 10m, 1h - ONLY for unlock/lock-check calls. Keep it short!"
                 config_set_arg '.unlock_retry_lock = $val' "$TUI_RESULT" ;;
+            6) if purge_cache_enabled; then
+                    config_set '.purge_cache_after_backup = false'
+                    echo "  >> Cache purge after backup disabled."
+                else
+                    config_set '.purge_cache_after_backup = true'
+                    echo "  >> Cache purge after backup enabled."
+                fi; sleep 1 ;;
             0) return ;;
         esac
     done
@@ -2564,6 +2658,7 @@ menu_ntfy_settings() {
                 unlock_retry_lock: "10m",
                 stale_unlock_hours: 2,
                 cache_dir: "~/.cache/restic",
+                purge_cache_after_backup: false,
                 retention: { keep_daily: 31, keep_weekly: 4, keep_monthly: 6, keep_yearly: 0, keep_last: 0, prune: true },
                 lock_state: { last_seen: "", last_unlock_attempt: "" },
                 notifications: { ntfy: { enabled: false } },
@@ -2870,8 +2965,8 @@ install_script() {
     fi
 
     # Point the config location in the installed file to /etc
-    sed -i 's|CONFIG_FILE="$(dirname "$SCRIPT_PATH")/.restic_backup.json"|CONFIG_FILE="/etc/restic_backup.json"|' "$target"
-    sed -i 's|OLD_CONFIG_FILE="$(dirname "$SCRIPT_PATH")/.restic_backup.env"|OLD_CONFIG_FILE="/etc/restic_backup.env"|' "$target"
+    sed -i 's|CONFIG_FILE="/etc/restic_backup.json"|CONFIG_FILE="/etc/restic_backup.json"|' "$target"
+    sed -i 's|OLD_CONFIG_FILE="/etc/restic_backup.env"|OLD_CONFIG_FILE="/etc/restic_backup.env"|' "$target"
 
     echo ">> Installation successful!"
     echo ">> You can now start the backup tool from anywhere with the command 'restic-backup'."
@@ -3005,6 +3100,12 @@ USAGE:  $S [FLAGS]    (flags can be combined)
   Older snapshots get deleted, then optionally --prune
   Applies to the main repo and all active copy repos
   Run manually with a preview: $S -C  (or TUI: C)
+
+── CACHE PURGE ────────────────────────────────────────────
+  TUI -> Edit configuration -> Global settings -> 6)
+  Optional boolean: purge the restic cache after every successful
+  backup. Saves disk space, but the next run re-downloads the index.
+  Manual, gentler cleanup: TUI -> C -> 4) Clean up local cache
 
 ── RETRY-LOCK SETTINGS ────────────────────────────────────
   There are TWO separate wait times (both in the TUI settings):
