@@ -12,8 +12,14 @@ export HOME="${HOME:-/root}"
 SCRIPT_VERSION="4.0"
 
 SCRIPT_PATH="$(realpath "$0")"
-CONFIG_FILE="/etc/restic_backup.json"
-OLD_CONFIG_FILE="/etc/restic_backup.env"
+# Portable by default: config next to the script. The installed copy at
+# /usr/local/bin/restic-backup uses the system-wide /etc configuration.
+CONFIG_FILE="$(dirname "$SCRIPT_PATH")/.restic_backup.json"
+OLD_CONFIG_FILE="$(dirname "$SCRIPT_PATH")/.restic_backup.env"
+if [ "$SCRIPT_PATH" = "/usr/local/bin/restic-backup" ]; then
+    CONFIG_FILE="/etc/restic_backup.json"
+    OLD_CONFIG_FILE="/etc/restic_backup.env"
+fi
 
 SYSTEMD_DIR="/etc/systemd/system"
 SERVICE_NAME="restic-sftp-backup.service"
@@ -2947,26 +2953,24 @@ install_script() {
     local target="/usr/local/bin/restic-backup"
 
     echo ">> Installing script to $target ..."
-    cp "$SCRIPT_PATH" "$target"
+    if [ "$SCRIPT_PATH" != "$target" ]; then
+        cp "$SCRIPT_PATH" "$target"
+    fi
     chmod +x "$target"
 
-    # Copy an existing configuration, if present
-    if [ -f "$CONFIG_FILE" ]; then
+    # Copy an existing (portable) configuration to the system-wide location
+    if [ -f "$CONFIG_FILE" ] && [ "$CONFIG_FILE" != "/etc/restic_backup.json" ]; then
         echo ">> Copying existing configuration to /etc/restic_backup.json ..."
         cp "$CONFIG_FILE" "/etc/restic_backup.json"
         chmod 600 "/etc/restic_backup.json"
     fi
 
     # If a very old .env file still exists
-    if [ -f "$OLD_CONFIG_FILE" ]; then
+    if [ -f "$OLD_CONFIG_FILE" ] && [ "$OLD_CONFIG_FILE" != "/etc/restic_backup.env" ]; then
         echo ">> Copying old .env configuration to /etc/restic_backup.env ..."
         cp "$OLD_CONFIG_FILE" "/etc/restic_backup.env"
         chmod 600 "/etc/restic_backup.env"
     fi
-
-    # Point the config location in the installed file to /etc
-    sed -i 's|CONFIG_FILE="/etc/restic_backup.json"|CONFIG_FILE="/etc/restic_backup.json"|' "$target"
-    sed -i 's|OLD_CONFIG_FILE="/etc/restic_backup.env"|OLD_CONFIG_FILE="/etc/restic_backup.env"|' "$target"
 
     echo ">> Installation successful!"
     echo ">> You can now start the backup tool from anywhere with the command 'restic-backup'."
@@ -2993,7 +2997,7 @@ install_script() {
 # ==========================================
 show_help() {
     local S; S=$(basename "$0")
-    local CFG; CFG="$(dirname "$(realpath "$0")")/.restic_backup.json"
+    local CFG="$CONFIG_FILE"
     cat << HELPEOF
 
 ══════════════════════════════════════════════════════════
